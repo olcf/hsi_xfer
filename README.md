@@ -45,3 +45,11 @@ Additional hidden flags:
 --checksum-threads=4 Launches more threads in the destination checksumming worker pool
 --disable-ta Launches the HSI get with -T off
 ```
+
+To run:
+```
+$ python3 -m venv venv
+$ source venv/bin/activate
+$ pip install -r requirements.txt
+$ ./hpss_batch_migration.py ...
+```
