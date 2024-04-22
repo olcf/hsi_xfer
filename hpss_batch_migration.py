@@ -619,7 +619,7 @@ class MigrateJob:
                     for f in files:
                         self.db.markfileasstaging(f[2])
                     # Run the job!
-                    output, rc = migration_job.run_new()
+                    output, rc = migration_job.run()
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                     for line in output:
                         if '(md5)' in line:
@@ -700,11 +700,14 @@ class MigrateJob:
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
-        output = self.ls_job.run()
+        output, rc = self.ls_job.run()
+        if rc != 0:
+            print("Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication!")
+            sys.exit(5)
 
         files = []
         dirs = []
-        for i in output.split('\n'):
+        for i in output:
             i = i.split("\t")
             if i[0] == 'FILE':
                 files.append(i)
@@ -753,11 +756,10 @@ class HSIJob:
         self.dirs = []
         self.ls_out = []
 
-    # TODO: Collapse run_new and run?
     # This will run HSI and capture any output EXCEPT for the passcode prompt, if the user so wanted to use RSA auth and not keytabs
     # If you're reading this, PLEASE tell the user they should just use keytabs. Their life will be easier. Our life will be eaiser.
     # Puppies will befriend kittens and the world will be at peace.
-    def run_new(self):
+    def run(self):
         cmd = self.hsi.split(" ")
         if self.flags is not None:
             cmd.extend(self.flags.split(" "))
@@ -780,19 +782,6 @@ class HSIJob:
             print("\n")
 
         return output, p.returncode
-
-    # TODO: Collapse run_new and run?
-    # This will run HSI and capture any output EXCEPT for the passcode prompt, if the user so wanted to use RSA auth and not keytabs
-    # If you're reading this, PLEASE tell the user they should just use keytabs. Their life will be easier. Our life will be eaiser.
-    # Puppies will befriend kittens and the world will be at peace.
-    def run(self):
-        cmd = self.hsi.split(" ")
-        if self.flags is not None:
-            cmd.extend(self.flags.split(" "))
-        cmd.extend(self.cmd.split(" "))
-        hsi_job = subprocess.run(cmd, stdout=PIPE, stderr=subprocess.STDOUT)
-        output = hsi_job.stdout.decode("utf-8").strip()
-        return output
 
     # Returns the full HSI command that will be run as a string. 
     def getcommand(self):

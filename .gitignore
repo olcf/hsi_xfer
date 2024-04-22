@@ -1,2 +1,4 @@
 *.sw*
 venv
+test_dest
+.json
