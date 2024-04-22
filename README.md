@@ -41,7 +41,7 @@ optional arguments:
 Additional hidden flags:
 
 ```
---vvs-per-job=1 Batches up multiple VVs into a single HSI job. 
+--vvs-per-job=1 Batches up multiple VVs into a single HSI job. Set to -1 to put ALL files into a single HSI job
 --checksum-threads=4 Launches more threads in the destination checksumming worker pool
 --disable-ta Launches the HSI get with -T off
 ```
