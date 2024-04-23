@@ -1,7 +1,7 @@
 # HPSS Batch Migration
 
 ```
-usage: hpss_batch_migration.py [-h] [--dry-run] [--db-path DB_PATH]
+usage: hpss_transfer_sorted_files.py [-h] [--dry-run] [--db-path DB_PATH]
                                [--preserve-file-lists] [--preserve-db]
                                [--disable-checksums]
                                [--additional-hsi-flags ADDITIONAL_HSI_FLAGS]
@@ -48,8 +48,7 @@ Additional hidden flags:
 
 To run:
 ```
-$ python3 -m venv venv
-$ source venv/bin/activate
-$ pip install -r requirements.txt
-$ ./hpss_batch_migration.py ...
+$ make
+$ ./hpss_transfer_sorted_files_dev ... # Runs against the hpss_transfer_sorted_files.py in your current working directory
+$ ./hpss_transfer_sorted_files ... # Runs agains the script in /sw/sources/hpss/bin
 ```
