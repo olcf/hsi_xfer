@@ -53,61 +53,6 @@ class TransferStatus(Enum):
     failed = 11
     skipped = 12
 
-class PBar:
-    def __init__(self, prefix, size):
-        self.line = ""
-        self.idx = 0.1
-        self.prefix=prefix
-        self.size=size
-        self.out=sys.stdout
-        self.count=0
-        self.remaining = None
-        self.start=time.time()
-
-    def increment(self, idx):
-        self.idx += idx
-
-    def show(self, j):
-        while True:
-            x = int(self.size*self.idx/self.count)
-            # time estimate calculation and string
-            self.remaining = ((time.time() - self.start) / self.idx) * (self.count - self.idx)        
-            mins, sec = divmod(self.remaining, 60) # limited to minutes
-            time_str = f"{int(mins):02}:{sec:03.1f}"
-            block = u"\u2588"
-            if len(self.line) > 0:
-                self.clear()
-                print(self.line, end="\r")
-                self.line = ""
-            print(f"{self.prefix}[{block*x}{(' '*(self.size-x))}] {int(self.idx)}/{self.count} Est wait {time_str}", end='\r', file=self.out, flush=True)
-            time.sleep(0.1)
-            if x + 0.1 >= self.size:
-                break
-
-    def start_bar(self, it): # Python3.6+
-        self.count = len(it)
-        self.bar = threading.Thread(target=self.show, args=(0.1,)) # avoid div/0 
-        self.bar.start()
-
-        for i, item in enumerate(it):
-            yield item
-            self.increment(1)
-
-        print("\n", flush=True, file=self.out)
-
-    def clear(self):
-        print("", end="\r")
-        print(" "*100, end="\r")
-
-    def print(self, s):
-        self.line = s+"\n"
-        # print("", end="\r")
-        # print(" "*100, end="\r")
-        # print(s)
-
-    def __del__(self):
-        self.bar.join()
-
 
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
@@ -220,7 +165,6 @@ class DBCache():
         if self.verbose:
             print("Creating files table from HPSS source...")
             files = alive_it(files)
-            #files = PBar(files)
         for file in files:
             vv = file[5]
             fpath = file[1]
