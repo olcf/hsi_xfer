@@ -2,3 +2,5 @@
 venv
 test_dest
 *.json
+*.list
+*.db
