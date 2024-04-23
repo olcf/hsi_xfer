@@ -659,6 +659,7 @@ def main():
     parser.add_argument('--checksum-threads', help=argparse.SUPPRESS, default=4)
     parser.add_argument('--disable-ta', default=False, help=argparse.SUPPRESS, action='store_true')
     parser.add_argument('--verbose', default=False, help="Output additional information about the transfer", action='store_true')
+    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"
     # Get our cli args
     args = parser.parse_args()
     # Create our migration job
