@@ -554,7 +554,7 @@ class MigrateJob:
     def getSrcFiles(self):
         output, rc = self.ls_job.run()
         if rc != 0:
-            print("Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication!")
+            print("Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in {}!".format(self.source))
             sys.exit(5)
 
         files = []
