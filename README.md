@@ -2,11 +2,13 @@
 
 ```
 usage: hpss_transfer_sorted_files.py [-h] [--dry-run] [--db-path DB_PATH]
-                               [--preserve-file-lists] [--preserve-db]
-                               [--disable-checksums]
-                               [--additional-hsi-flags ADDITIONAL_HSI_FLAGS]
-                               [--overwrite-existing] [--verbose]
-                               source destination
+                                     [--preserve-file-lists] [--preserve-db]
+                                     [--disable-checksums]
+                                     [--additional-hsi-flags ADDITIONAL_HSI_FLAGS]
+                                     [--overwrite-existing] [--verbose]
+                                     source destination
+
+NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!
 
 positional arguments:
   source                Top level directory in HPSS to pull files from. This
