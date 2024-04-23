@@ -1,4 +1,4 @@
-# HPSS Batch Migration
+# HPSS Transfer Sorted Files
 
 ```
 usage: hpss_transfer_sorted_files.py [-h] [--dry-run] [--db-path DB_PATH]
