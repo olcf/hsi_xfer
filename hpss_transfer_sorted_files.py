@@ -58,15 +58,16 @@ class TransferStatus(Enum):
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
 class DBCache:
-    def __init__(self, cleanup, verbose, path=None):
+    def __init__(self, cleanup, verbose, output_path, path=None):
         self.verbose = verbose
+        self.output_path = output_path
         self.preservedb = cleanup
         self.lock = threading.Lock()
         self.stmts = []
         if path is None:
             self.unmanaged_db = False
             self.dbpath = os.path.join(
-                os.getcwd(), f"hpss_transfer_sorted_files_{int(time.time())}.db"
+                self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
             )
             self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
             self.cur = self.db.cursor()
@@ -424,9 +425,10 @@ class DBCache:
 class MigrateJob:
     def __init__(self, args):
         self.source = os.path.normpath(args.source)
-        self.destination = os.path.normpath(args.destination)
+        self.destination = os.path.abspath(os.path.normpath(args.destination))
         self.dry_run = args.dry_run
         self.verbose = args.verbose
+        self.output_path = os.path.normpath(args.preserved_files_path)
 
         self.preserve_file_lists = args.preserve_file_lists
         self.preserve_db = args.preserve_db
@@ -440,9 +442,9 @@ class MigrateJob:
 
         # If --db-path is defined, do not create a new db, use the one at the path provided
         if args.db_path is not None:
-            self.db = DBCache(self.preserve_db, self.verbose, path=args.db_path)
+            self.db = DBCache(self.preserve_db, self.verbose, self.output_path, path=args.db_path)
         else:
-            self.db = DBCache(self.preserve_db, self.verbose)
+            self.db = DBCache(self.preserve_db, self.verbose, self.output_path)
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -545,7 +547,7 @@ class MigrateJob:
 
                 filelistnum += 1
                 infilename = os.path.join(
-                    os.getcwd(), f"hpss_transfer_sorted_files.{filelistnum}.list"
+                    self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
                 # Write the infile to be passed into HSI
                 with open(infilename, "w") as infile:
@@ -842,6 +844,11 @@ def main():
         default=False,
         action="store_true",
         help="Force overwrite of existing files that match the file names in HPSS",
+    )
+    parser.add_argument(
+        "--preserved-files-path",
+        default=os.getcwd(),
+        help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
     parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1)
     parser.add_argument("--checksum-threads", help=argparse.SUPPRESS, default=4)
