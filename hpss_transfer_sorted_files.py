@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import sys
+import colorlog
+import logging
 import os
 import subprocess
 from multiprocessing.pool import ThreadPool as Pool
@@ -13,7 +15,6 @@ import json
 
 from enum import Enum
 from alive_progress import alive_it
-
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -117,13 +118,13 @@ class DBCache:
                 self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
                 self.cur = self.db.cursor()
             except:
-                print("Can not open {}. Database may be corrupt".format(self.dbpath))
+                logging.critical("Can not open {}. Database may be corrupt".format(self.dbpath))
                 sys.exit(3)
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
     def __del__(self):
         if self.preservedb:
-            print("DB saved at {}".format(self.dbpath))
+            logging.info("DB saved at {}".format(self.dbpath))
         else:
             if not self.unmanaged_db:
                 os.remove(self.dbpath)
@@ -174,8 +175,8 @@ class DBCache:
 
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
+        logging.debug("Building destination tree cache table...")
         if self.verbose:
-            print("Building destination tree cache table...")
             tree = alive_it(tree)
         for dest in tree:
             self._add_to_tx(
@@ -185,8 +186,8 @@ class DBCache:
 
     # Insert file entries into the files table
     def insertfiles(self, files, srcroot, destroot):
+        logging.debug("Creating files table from HPSS source...")
         if self.verbose:
-            print("Creating files table from HPSS source...")
             files = alive_it(files)
         for file in files:
             vv = file[5]
@@ -200,7 +201,7 @@ class DBCache:
 
                 destid = self.getdest(dest)[0]
                 if destid == []:
-                    print("No destination found; Cowardly failing...")
+                    logging.critical("No destination found; Cowardly failing...")
                     sys.exit(2)
 
                 self._execute(
@@ -226,7 +227,7 @@ class DBCache:
 
                 fileid = self.fileExists(fpath)
                 if fileid is None:
-                    print("Commit to DB did not work as intended. Internal Error!")
+                    logging.critical("Commit to DB did not work as intended. Internal Error!")
                     sys.exit(1)
 
                 self._add_to_tx(
@@ -234,7 +235,7 @@ class DBCache:
                     [fpath, 0, fileid],
                 )
             else:
-                print("File already in DB")
+                logging.debug("File already in DB")
         self._execute_tx()
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
@@ -473,13 +474,12 @@ class MigrateJob:
             try:
                 os.mkdir(path[1])
             except FileExistsError:
-                if self.verbose:
-                    print(
-                        "Skipping mkdir of {}; directory already exists".format(path[1])
-                    )
+                logging.debug(
+                    "Skipping mkdir of {}; directory already exists".format(path[1])
+                )
                 self.db.markdestcreated(path[0])
             except:
-                print(
+                logging.critical(
                     "ERROR: Could not create destination directory. Do you have the correct permissions?"
                 )
                 sys.exit(3)
@@ -495,7 +495,7 @@ class MigrateJob:
         # Generator to created a chunked list of vv's
         def chunk(lst, chunksize):
             if chunksize < 0 and chunksize != -1:
-                print("vvs-per-job needs to be either -1 or a positive integer!")
+                logging.critical("vvs-per-job needs to be either -1 or a positive integer!")
                 sys.exit(4)
             if chunksize == -1:
                 yield lst
@@ -512,12 +512,11 @@ class MigrateJob:
         if self.overwrite:
             existingFiles = []
 
-        if len(existingFiles) > 0 and self.verbose:
-            print("Found existing files:")
-            print(json.dumps(existingFiles, indent=2))
-            print("\n")
+        if len(existingFiles) > 0:
+            logging.debug("Found existing files:")
+            logging.debug(json.dumps(existingFiles, indent=2))
 
-        print(
+        logging.info(
             "Starting migration of files from {} to {}".format(
                 self.source, self.destination
             )
@@ -552,11 +551,11 @@ class MigrateJob:
                 # Write the infile to be passed into HSI
                 with open(infilename, "w") as infile:
                     getcmd = "get -T on << EOF\n"
-                    hashcreatecmd = "hashcreate -T on << EOF\n"
+                    # hashcreate can not use the TA, so we force -T off
+                    hashcreatecmd = "hashcreate -T off << EOF\n"
 
                     if self.disable_ta:
                         getcmd = "get -T off << EOF\n"
-                        hashcreatecmd = "hashcreate -T off << EOF\n"
 
                     infile.write(getcmd)
                     infile.write(
@@ -590,11 +589,10 @@ class MigrateJob:
                             checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
                             self.db.setsrcchecksum(srcpath, checksum)
                             self.db.markfileashpsschecksumcomplete(srcpath)
-                            if self.verbose:
-                                print("Completed transfer for file {}".format(srcpath))
+                            logging.debug("Completed transfer for file {}".format(srcpath))
                             self.db.markfileastransfercompleted(srcpath)
                         if "get: Error" in line:
-                            print(
+                            logging.info(
                                 "File {} failed to transfer from HPSS".format(
                                     line.split(" ")[-1]
                                 )
@@ -602,14 +600,14 @@ class MigrateJob:
                             self.db.markasfailed(line.split(" ")[-1])
                     # Update our stats
                     filesCompleted += len(files)
-                    if self.addl_flags is not None or self.verbose:
-                        print(
+                    if self.addl_flags is not None:
+                        logging.debug(
                             "{}/{} file transfers have been attempted".format(
                                 filesCompleted, filesTotal
                             )
                         )
                 else:
-                    print("Would have run: {}".format(migration_job.getcommand()))
+                    logging.info("Would have run: {}".format(migration_job.getcommand()))
 
                 # Remove infile list if we're not worried about preserving
                 if not self.preserve_file_lists:
@@ -638,13 +636,12 @@ class MigrateJob:
         ret["checksum_mismatch"] = []
         if len(files) > 0:
             for file in files:
-                if self.verbose:
-                    print("Checksum did not match! Can not guarantee file integrity!")
-                    print(
-                        " - {}({}) : {}({})".format(
-                            files[1], files[2], files[3], files[4]
-                        )
+                logging.debug("Checksum did not match! Can not guarantee file integrity!")
+                logging.debug(
+                    " - {}({}) : {}({})".format(
+                        files[1], files[2], files[3], files[4]
                     )
+                )
                 ret["checksum_mismatch"].append(
                     {
                         "source": (files[1], files[2]),
@@ -652,8 +649,7 @@ class MigrateJob:
                     }
                 )
         else:
-            if self.verbose:
-                print("All files checksummed :)")
+            logging.debug("All files checksummed :)")
         return ret
 
     # Generates our overall report. This will get written out to a JSON file for users
@@ -688,7 +684,7 @@ class MigrateJob:
     def getSrcFiles(self):
         output, rc = self.ls_job.run()
         if rc != 0:
-            print(
+            logging.critical(
                 "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in {}!".format(
                     self.source
                 )
@@ -778,11 +774,11 @@ class HSIJob:
             output.append(line.strip())
         p.wait()
 
-        if p.returncode != 0 and self.verbose:
-            print("\n")
+        if p.returncode != 0:
+            logging.debug("\n")
             for i in output:
-                print(i)
-            print("\n")
+                logging.debug(i)
+            logging.debug("\n")
 
         return output, p.returncode
 
@@ -794,15 +790,24 @@ class HSIJob:
         cmd.extend(self.cmd.split(" "))
         return " ".join(cmd)
 
+def initLogger(verbose):
+    if verbose:
+        #logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+        logging.basicConfig(level=logging.DEBUG, format='', datefmt='%m/%d/%Y %I:%M:%S %p')
+    else:
+        #logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+        logging.basicConfig(level=logging.INFO, format='', datefmt='%m/%d/%Y %I:%M:%S %p')
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "source",
+        type=str,
         help="Top level directory in HPSS to pull files from. This is a recursive action!",
     )
     parser.add_argument(
         "destination",
+        type=str,
         help="Top level directory on Kronos to put files. An identical directory structure will be created here as exists in HPSS under `source`",
     )
     parser.add_argument(
@@ -814,6 +819,7 @@ def main():
     parser.add_argument(
         "--db-path",
         default=None,
+        type=str,
         help="Path to existing db generated by --preserve-db, or from an interrupted job. Picks up where the last job left off",
     )
     parser.add_argument(
@@ -837,6 +843,7 @@ def main():
     parser.add_argument(
         "--additional-hsi-flags",
         default=None,
+        type=str,
         help="Additional flags needed to be passed to `hsi`",
     )
     parser.add_argument(
@@ -848,10 +855,11 @@ def main():
     parser.add_argument(
         "--preserved-files-path",
         default=os.getcwd(),
+        type=str,
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
-    parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1)
-    parser.add_argument("--checksum-threads", help=argparse.SUPPRESS, default=4)
+    parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
+    parser.add_argument("--checksum-threads", help=argparse.SUPPRESS, default=4, type=int)
     parser.add_argument(
         "--disable-ta", default=False, help=argparse.SUPPRESS, action="store_true"
     )
@@ -864,27 +872,25 @@ def main():
     parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"
     # Get our cli args
     args = parser.parse_args()
+    initLogger(args.verbose)
     # Create our migration job
     job = MigrateJob(args)
 
     if args.db_path is not None:
-        print("Resuming interrupted transfer.")
+        logging.info("Resuming interrupted transfer.")
 
     # Populate the db with HPSS data
     if args.db_path is None:
-        if args.verbose:
-            print("Getting file data from HPSS...")
+        logging.debug("Getting file data from HPSS...")
         job.getSrcFiles()
 
     # Check for files that exist in the destination
-    if args.verbose:
-        print("Checking for existing files...")
+    logging.debug("Checking for existing files...")
     job.checkForExisting()
 
     # Create the destination directory structure
     if not args.dry_run:
-        if args.verbose:
-            print("Creating destination directory structure")
+        logging.debug("Creating destination directory structure")
         job.createDestTree()
 
     # Create our main threads here. One for migration, the other for checksumming
@@ -911,8 +917,7 @@ def main():
     # generate report
     finalreport = job.genReport(report)
 
-    if args.verbose:
-        print(json.dumps(finalreport, indent=2))
+    logging.debug(json.dumps(finalreport, indent=2))
 
     # Write the report to a file
     if not args.dry_run:
@@ -921,7 +926,7 @@ def main():
         )
         with open(reportfilename, "w") as f:
             json.dump(finalreport, f, indent=2)
-        print("Transfer complete. Report has been written to {}".format(reportfilename))
+        logging.info("Transfer complete. Report has been written to {}".format(reportfilename))
 
 
 if __name__ == "__main__":
