@@ -57,7 +57,7 @@ class TransferStatus(Enum):
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
-class DBCache():
+class DBCache:
     def __init__(self, cleanup, verbose, path=None):
         self.verbose = verbose
         self.preservedb = cleanup
@@ -65,19 +65,26 @@ class DBCache():
         self.stmts = []
         if path is None:
             self.unmanaged_db = False
-            self.dbpath = "{}/hpss_transfer_sorted_files_{}.db".format(os.getcwd(), int(time.time())) 
+            self.dbpath = os.path.join(
+                os.getcwd(), f"hpss_transfer_sorted_files_{int(time.time())}.db"
+            )
             self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
             self.cur = self.db.cursor()
 
-            self.cur.execute("""
+            self.cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS vvs(id INTEGER PRIMARY KEY,
                 name TEXT,
-                is_tape BOOLEAN)""")
-            self.cur.execute("""
+                is_tape BOOLEAN)"""
+            )
+            self.cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS desttree(id INTEGER PRIMARY KEY,
                 path TEXT,
-                created BOOLEAN)""")
-            self.cur.execute("""
+                created BOOLEAN)"""
+            )
+            self.cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,
                 path TEXT,
                 perms TEXT,
@@ -92,13 +99,16 @@ class DBCache():
                 destdir INTEGER,
                 destfileexists BOOLEAN,
                 FOREIGN KEY (vv) REFERENCES vvs(id),
-                FOREIGN KEY (destdir) REFERENCES desttree(id))""")
-            self.cur.execute("""
+                FOREIGN KEY (destdir) REFERENCES desttree(id))"""
+            )
+            self.cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS destination(id INTEGER PRIMARY KEY,
                 path TEXT,
                 completed BOOLEAN,
                 srcfile INTEGER,
-                FOREIGN KEY (srcfile) REFERENCES files(id))""")
+                FOREIGN KEY (srcfile) REFERENCES files(id))"""
+            )
         else:
             self.unmanaged_db = True
             self.dbpath = path
@@ -117,32 +127,42 @@ class DBCache():
             if not self.unmanaged_db:
                 os.remove(self.dbpath)
 
-    def _execute(self, stmt):
+    def _execute(self, stmt, args=None):
         try:
             self.lock.acquire(True)
-            self.cur.execute(stmt)
+            if args is not None:
+                self.cur.execute(stmt, args)
+            else:
+                self.cur.execute(stmt)
             self.db.commit()
         finally:
             self.lock.release()
 
-    def _add_to_tx(self, stmt):
-        self.stmts.append(stmt)
+    def _add_to_tx(self, stmt, args=None):
+        tmp = (stmt, args)
+        self.stmts.append(tmp)
 
     def _execute_tx(self):
         try:
             self.lock.acquire(True)
             for stmt in self.stmts:
-                self.cur.execute(stmt)
+                if stmt[1] is not None:
+                    self.cur.execute(stmt[0], stmt[1])
+                else:
+                    self.cur.execute(stmt[0])
             self.db.commit()
         finally:
             self.stmts = []
             self.lock.release()
 
-    def _get_rows(self, stmt, maxrows=None):
+    def _get_rows(self, stmt, args=None, maxrows=None):
         rows = []
         try:
             self.lock.acquire(True)
-            res = self.cur.execute(stmt)
+            if args is not None:
+                res = self.cur.execute(stmt, args)
+            else:
+                res = self.cur.execute(stmt)
             if maxrows == 1:
                 rows = res.fetchone()
             else:
@@ -157,7 +177,9 @@ class DBCache():
             print("Building destination tree cache table...")
             tree = alive_it(tree)
         for dest in tree:
-            self._add_to_tx("INSERT INTO desttree (path, created) VALUES ('{}', 0)".format(dest))
+            self._add_to_tx(
+                "INSERT INTO desttree (path, created) VALUES (?, 0)", [dest]
+            )
         self._execute_tx()
 
     # Insert file entries into the files table
@@ -180,7 +202,8 @@ class DBCache():
                     print("No destination found; Cowardly failing...")
                     sys.exit(2)
 
-                self._execute("""INSERT INTO files (
+                self._execute(
+                    """INSERT INTO files (
                         path, 
                         vv, 
                         dest, 
@@ -188,90 +211,141 @@ class DBCache():
                         checksum_status, 
                         transfer_status,
                         destfileexists) 
-                    VALUES ('{}', {}, '{}', {}, {}, {}, {})""".format(fpath, vvid, dest, destid, ChecksumStatus.not_attempted.value, TransferStatus.not_started.value, 0))
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        fpath,
+                        vvid,
+                        dest,
+                        destid,
+                        ChecksumStatus.not_attempted.value,
+                        TransferStatus.not_started.value,
+                        0,
+                    ],
+                )
 
                 fileid = self.fileExists(fpath)
                 if fileid is None:
                     print("Commit to DB did not work as intended. Internal Error!")
                     sys.exit(1)
 
-                self._add_to_tx("INSERT INTO destination (path, completed, srcfile) VALUES ('{}', {}, {})".format(fpath, 0, fileid))
+                self._add_to_tx(
+                    "INSERT INTO destination (path, completed, srcfile) VALUES (?, ?, ?)",
+                    [fpath, 0, fileid],
+                )
             else:
                 print("File already in DB")
         self._execute_tx()
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
-        rows = self._get_rows("SELECT path,dest,id FROM files WHERE transfer_status={} AND checksum_status <> {}".format(TransferStatus.completed.value, ChecksumStatus.failed.value))
+        rows = self._get_rows(
+            "SELECT path,dest,id FROM files WHERE transfer_status=? AND checksum_status <> ?",
+            [TransferStatus.completed.value, ChecksumStatus.failed.value],
+        )
         return rows
 
     # returns all files that failed transfers
     def getfailedtransfers(self):
-        rows = self._get_rows("SELECT path,dest FROM files WHERE transfer_status={}".format(TransferStatus.failed.value))
+        rows = self._get_rows(
+            "SELECT path,dest FROM files WHERE transfer_status=?",
+            [TransferStatus.failed.value],
+        )
         return rows
 
     # Gets all files that failed checksumming
     def getfailedchecksums(self):
-        rows = self._get_rows("SELECT path,src_checksum,dest,dest_checksum FROM files WHERE checksum_status={}".format(ChecksumStatus.failed.value))
+        rows = self._get_rows(
+            "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE checksum_status=?",
+            [ChecksumStatus.failed.value],
+        )
         return rows
 
     # Get all files that successfully finished transferrring and checksumming
     def getsuccessfultransfers(self):
-        rows = self._get_rows("SELECT path,dest,dest_checksum FROM files WHERE checksum_status={} AND transfer_status={}".format(ChecksumStatus.completed.value, TransferStatus.completed.value))
+        rows = self._get_rows(
+            "SELECT path,dest,dest_checksum FROM files WHERE checksum_status=? AND transfer_status=?",
+            [ChecksumStatus.completed.value, TransferStatus.completed.value],
+        )
         return rows
 
     # Mark a file entry as failed to transfer
     def markasfailed(self, srcpath):
-        self._execute("UPDATE files SET transfer_status={} WHERE path = '{}'".format(TransferStatus.failed.value, srcpath))
+        self._execute(
+            "UPDATE files SET transfer_status=? WHERE path = ?",
+            [TransferStatus.failed.value, srcpath],
+        )
 
     # Mark a destination driectory as created
     def markdestcreated(self, destid):
-        self._execute("UPDATE desttree SET created=1 WHERE id = {}".format(destid))
+        self._execute("UPDATE desttree SET created=1 WHERE id = ?", [destid])
 
     # Marks a file as 'staging' this is more or less equiv to 'transferring'
     def markfileasstaging(self, fileid):
-        self._execute("UPDATE files SET transfer_status={} WHERE id = {}".format(TransferStatus.staging.value, fileid))
+        self._execute(
+            "UPDATE files SET transfer_status=? WHERE id = ?",
+            [TransferStatus.staging.value, fileid],
+        )
 
     # Set the value of the hpss-derived checksum for the file object
     def setsrcchecksum(self, srcpath, checksum):
-        self._execute("UPDATE files SET src_checksum='{}' WHERE path = '{}'".format(checksum, srcpath))
+        self._execute(
+            "UPDATE files SET src_checksum=? WHERE path = ?", [checksum, srcpath]
+        )
 
     # Sets the value of the md5sum performed at the destination
     def setdestchecksum(self, fileid, checksum):
-        self._execute("UPDATE files SET dest_checksum='{}' WHERE id = {}".format(checksum, fileid))
+        self._execute(
+            "UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
+        )
 
     # Marks the checksum status of a file as completed
     def markfilechecksumascomplete(self, fileid):
-        self._execute("UPDATE files SET checksum_status={} WHERE id = {}".format(ChecksumStatus.completed.value, fileid))
+        self._execute(
+            "UPDATE files SET checksum_status=? WHERE id = ?",
+            [ChecksumStatus.completed.value, fileid],
+        )
 
     # Marks the checksum status of a file as failed
     def markfilechecksumasfailed(self, fileid):
-        self.cur._execute("UPDATE files SET checksum_status={} WHERE id = {}".format(ChecksumStatus.failed.value, fileid))
+        self._execute(
+            "UPDATE files SET checksum_status=? WHERE id = ?",
+            [ChecksumStatus.failed.value, fileid],
+        )
 
     # Marks the file trasfer as completed
     def markfileastransfercompleted(self, srcpath):
-        self._execute("UPDATE files SET transfer_status={} WHERE path = '{}'".format(TransferStatus.completed.value, srcpath))
+        self._execute(
+            "UPDATE files SET transfer_status=? WHERE path = ?",
+            [TransferStatus.completed.value, srcpath],
+        )
 
     # Marks the file as hpss_checksum_complete
     def markfileashpsschecksumcomplete(self, srcpath):
-        self._execute("UPDATE files SET checksum_status={} WHERE path = '{}'".format(ChecksumStatus.hpss_complete.value, srcpath))
+        self._execute(
+            "UPDATE files SET checksum_status=? WHERE path = ?",
+            [ChecksumStatus.hpss_complete.value, srcpath],
+        )
 
     # Inserts a VV into the vvs table
     def insertvv(self, vv):
         istape = False
         if "X" in vv or "H" in vv:
             istape = True
-        self._execute("INSERT INTO vvs (name, is_tape) VALUES ('{}', {})".format(vv, int(istape)))
+        self._execute(
+            "INSERT INTO vvs (name, is_tape) VALUES (?, ?)", [vv, int(istape)]
+        )
 
     # Retrieve a vv entry by name
     def getvv(self, vv):
-        rows = self._get_rows("SELECT id, name FROM vvs WHERE name LIKE '{}'".format(vv))
+        rows = self._get_rows("SELECT id, name FROM vvs WHERE name LIKE ?", [vv])
         return rows
 
     # Get a destination driectory entry by path
     def getdest(self, path):
         dirname = os.path.dirname(path)
-        rows = self._get_rows("SELECT id, path FROM desttree WHERE path LIKE '{}'".format(dirname))
+        rows = self._get_rows(
+            "SELECT id, path FROM desttree WHERE path LIKE ?", [dirname]
+        )
         return rows[0]
 
     # Get the total number of files in the files table in the db
@@ -281,7 +355,9 @@ class DBCache():
 
     # Get file entries where the source and dest checksums do not match
     def getnonmatchingchecksums(self):
-        rows = self._get_rows("SELECT path,src_checksum,dest,dest_checksum FROM files WHERE dest_checksum <> src_checksum")
+        rows = self._get_rows(
+            "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE dest_checksum <> src_checksum"
+        )
         return rows
 
     # Get files marked as 'destination file exists'
@@ -291,12 +367,15 @@ class DBCache():
 
     # get a file by source path
     def getfile(self, file):
-        rows = self._get_rows("SELECT id, path FROM files WHERE path LIKE '{}'".format(file))
+        rows = self._get_rows("SELECT id, path FROM files WHERE path LIKE ?", [file])
         return rows
 
     # Get a list of files by VV (DB) id
     def getfilesbyvv(self, vvid):
-        rows = self._get_rows("SELECT path,dest,id FROM files WHERE vv = {} AND transfer_status <> {}".format(vvid, TransferStatus.completed.value))
+        rows = self._get_rows(
+            "SELECT path,dest,id FROM files WHERE vv = ? AND transfer_status <> ?",
+            [vvid, TransferStatus.completed.value],
+        )
         return rows
 
     # Dump the files table
@@ -306,7 +385,10 @@ class DBCache():
 
     # Get list of vvs that have non-complete file transfers
     def getvvswithnoncompletefiles(self):
-        rows = self._get_rows("SELECT DISTINCT vv FROM files where transfer_status <> {}".format(TransferStatus.completed.value))
+        rows = self._get_rows(
+            "SELECT DISTINCT vv FROM files where transfer_status <> ?",
+            [TransferStatus.completed.value],
+        )
         return rows
 
     # dump the desttree table
@@ -332,14 +414,17 @@ class DBCache():
 
     # Mark a file as 'destination file exists'
     def markexists(self, fileid):
-        self._execute("UPDATE files SET destfileexists=1,transfer_status={} WHERE id={}".format(TransferStatus.skipped.value, fileid))
+        self._execute(
+            "UPDATE files SET destfileexists=1,transfer_status=? WHERE id=?",
+            [TransferStatus.skipped.value, fileid],
+        )
 
 
 # Object to manage the HSIJobs required for migration of files in the DB
 class MigrateJob:
     def __init__(self, args):
-        self.source = args.source
-        self.destination = args.destination
+        self.source = os.path.normpath(args.source)
+        self.destination = os.path.normpath(args.destination)
         self.dry_run = args.dry_run
         self.verbose = args.verbose
 
@@ -360,7 +445,13 @@ class MigrateJob:
             self.db = DBCache(self.preserve_db, self.verbose)
 
         # Define the HSIJob that lists all the files recursively in the source directory
-        self.ls_job = HSIJob(self.hsi, self.addl_flags, True, self.verbose, "ls -R -P {}".format(self.source))
+        self.ls_job = HSIJob(
+            self.hsi,
+            self.addl_flags,
+            True,
+            self.verbose,
+            "ls -R -P {}".format(self.source),
+        )
 
     # Check the destination filesystem for files that match names at the predicted destination directory
     def checkForExisting(self):
@@ -381,16 +472,20 @@ class MigrateJob:
                 os.mkdir(path[1])
             except FileExistsError:
                 if self.verbose:
-                    print("Skipping mkdir of {}; directory already exists".format(path[1]))
+                    print(
+                        "Skipping mkdir of {}; directory already exists".format(path[1])
+                    )
                 self.db.markdestcreated(path[0])
             except:
-                print("ERROR: Could not create destination directory. Do you have the correct permissions?")
+                print(
+                    "ERROR: Could not create destination directory. Do you have the correct permissions?"
+                )
                 sys.exit(3)
             else:
                 self.db.markdestcreated(path[0])
 
     # This is the main migration thread! All the fun stuff happens here
-    # - Generates the file lists 
+    # - Generates the file lists
     # - Calls HSI to migrate and hash files
     # - Populate the db with the resulting information
     # - Profit
@@ -403,7 +498,7 @@ class MigrateJob:
             if chunksize == -1:
                 yield lst
             for i in range(0, len(lst), chunksize):
-                yield lst[i:i + chunksize]
+                yield lst[i : i + chunksize]
 
         # Get chunked list of vvs
         allvvs = self.db.getvvswithnoncompletefiles()
@@ -420,7 +515,11 @@ class MigrateJob:
             print(json.dumps(existingFiles, indent=2))
             print("\n")
 
-        print("Starting migration of files from {} to {}".format(self.source, self.destination))
+        print(
+            "Starting migration of files from {} to {}".format(
+                self.source, self.destination
+            )
+        )
 
         # Set some variables for status output (esp if not using the progress bar)
         filelistnum = 0
@@ -440,34 +539,44 @@ class MigrateJob:
             for vv in vvlist:
                 files.extend(self.db.getfilesbyvv(vv[0]))
 
-            files = [ f for f in files if f not in existingFiles ]
+            files = [f for f in files if f not in existingFiles]
 
             if len(files) > 0:
 
                 filelistnum += 1
-                infilename = "{}/hpss_transfer_sorted_files.{}.list".format(os.getcwd(), filelistnum)
+                infilename = os.path.join(
+                    os.getcwd(), f"hpss_transfer_sorted_files.{filelistnum}.list"
+                )
                 # Write the infile to be passed into HSI
-                with open(infilename, 'w') as infile:
-                    getcmd = 'get -T on << EOF\n'
-                    hashcreatecmd = 'hashcreate -T on << EOF\n'
+                with open(infilename, "w") as infile:
+                    getcmd = "get -T on << EOF\n"
+                    hashcreatecmd = "hashcreate -T on << EOF\n"
 
                     if self.disable_ta:
-                        getcmd = 'get -T off << EOF\n'
-                        hashcreatecmd = 'hashcreate -T off << EOF\n'
+                        getcmd = "get -T off << EOF\n"
+                        hashcreatecmd = "hashcreate -T off << EOF\n"
 
                     infile.write(getcmd)
-                    infile.write('\n'.join([ '{} : {}'.format(f[1], f[0]) for f in files ]))
-                    infile.write('\nEOF\n')
+                    infile.write(
+                        "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
+                    )
+                    infile.write("\nEOF\n")
                     # Add a hashcreate command to generate and get hashes in the same job.
                     # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
                     # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
                     if not self.disable_checksums:
                         infile.write(hashcreatecmd)
-                        infile.write('\n'.join([ '{}'.format(f[0]) for f in files ]))
-                        infile.write('\nEOF\n')
+                        infile.write("\n".join(["{}".format(f[0]) for f in files]))
+                        infile.write("\nEOF\n")
 
                 # This is our HSI job
-                migration_job = HSIJob(self.hsi, self.addl_flags, True, self.verbose, "in {}".format(infilename))
+                migration_job = HSIJob(
+                    self.hsi,
+                    self.addl_flags,
+                    True,
+                    self.verbose,
+                    "in {}".format(infilename),
+                )
                 if not self.dry_run:
                     for f in files:
                         self.db.markfileasstaging(f[2])
@@ -475,20 +584,28 @@ class MigrateJob:
                     output, rc = migration_job.run()
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                     for line in output:
-                        if '(md5)' in line:
+                        if "(md5)" in line:
                             checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
                             self.db.setsrcchecksum(srcpath, checksum)
                             self.db.markfileashpsschecksumcomplete(srcpath)
                             if self.verbose:
                                 print("Completed transfer for file {}".format(srcpath))
                             self.db.markfileastransfercompleted(srcpath)
-                        if 'get: Error' in line:
-                            print("File {} failed to transfer from HPSS".format(line.split(" ")[-1]))
+                        if "get: Error" in line:
+                            print(
+                                "File {} failed to transfer from HPSS".format(
+                                    line.split(" ")[-1]
+                                )
+                            )
                             self.db.markasfailed(line.split(" ")[-1])
                     # Update our stats
                     filesCompleted += len(files)
                     if self.addl_flags is not None or self.verbose:
-                        print("{}/{} file transfers have been attempted".format(filesCompleted, filesTotal))
+                        print(
+                            "{}/{} file transfers have been attempted".format(
+                                filesCompleted, filesTotal
+                            )
+                        )
                 else:
                     print("Would have run: {}".format(migration_job.getcommand()))
 
@@ -521,8 +638,17 @@ class MigrateJob:
             for file in files:
                 if self.verbose:
                     print("Checksum did not match! Can not guarantee file integrity!")
-                    print(" - {}({}) : {}({})".format(files[1], files[2], files[3], files[4]))
-                ret["checksum_mismatch"].append({'source': (files[1], files[2]), 'destination': (files[3], files[4])})
+                    print(
+                        " - {}({}) : {}({})".format(
+                            files[1], files[2], files[3], files[4]
+                        )
+                    )
+                ret["checksum_mismatch"].append(
+                    {
+                        "source": (files[1], files[2]),
+                        "destination": (files[3], files[4]),
+                    }
+                )
         else:
             if self.verbose:
                 print("All files checksummed :)")
@@ -534,19 +660,25 @@ class MigrateJob:
         failedtransfers = self.db.getfailedtransfers()
         report["failed_transfers"] = []
         for f in failedtransfers:
-            report["failed_transfers"].append({'source': f[0], 'destination': f[1]})
+            report["failed_transfers"].append({"source": f[0], "destination": f[1]})
         failedchecksums = self.db.getfailedchecksums()
         report["failed_to_checksum"] = []
         for f in failedchecksums:
-            report["failed_to_checksum"].append({'source': (f[0], f[1]), 'destination': (f[2], f[3])})
+            report["failed_to_checksum"].append(
+                {"source": (f[0], f[1]), "destination": (f[2], f[3])}
+            )
         succeededfiles = self.db.getsuccessfultransfers()
         report["successful_transfers"] = []
         for f in succeededfiles:
-            report["successful_transfers"].append({'source': f[0], 'destination': f[1], 'checksum': f[2]})
+            report["successful_transfers"].append(
+                {"source": f[0], "destination": f[1], "checksum": f[2]}
+            )
         existingfiles = self.db.getexistingfiles()
         report["existing_files_skipped"] = []
         for f in existingfiles:
-            report["existing_files_skipped"].append({'source': f[0], 'destination': f[1]})
+            report["existing_files_skipped"].append(
+                {"source": f[0], "destination": f[1]}
+            )
 
         return report
 
@@ -554,27 +686,31 @@ class MigrateJob:
     def getSrcFiles(self):
         output, rc = self.ls_job.run()
         if rc != 0:
-            print("Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in {}!".format(self.source))
+            print(
+                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in {}!".format(
+                    self.source
+                )
+            )
             sys.exit(5)
 
         files = []
         dirs = []
         for i in output:
             i = i.split("\t")
-            if i[0] == 'FILE':
+            if i[0] == "FILE":
                 files.append(i)
-            elif i[0] == 'DIRECTORY':
+            elif i[0] == "DIRECTORY":
                 dirs.append(i)
 
         # Removing junk from array
-        dirs = [ d[1].replace(self.source, self.destination) for d in dirs ]
+        dirs = [d[1].replace(self.source, self.destination) for d in dirs]
         # Adding the root destination since files can be at depth 0
         dirs.append(self.destination)
         self.db.insertdesttree(dirs)
         self.db.insertfiles(files, self.source, self.destination)
 
 
-# Due to the fact that multiprocessing is weird, and pickles things that get passed to the pool (including the function itself), 
+# Due to the fact that multiprocessing is weird, and pickles things that get passed to the pool (including the function itself),
 # and the fact that the MigrationJob object contains a DBCache object that contains non-serializable data (thread locks), we go
 # ahead and play it safe and pull this function outside the object. Yay.
 # This function performs a single md5sum on a single file in the destination. Thread pool worker
@@ -584,11 +720,18 @@ def doDestChecksum(file):
     cmd = "md5sum {}".format(file[1]).split(" ")
 
     output = []
-    p = subprocess.run(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True)
+    p = subprocess.run(
+        cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True
+    )
 
     output = p.stdout.strip()
     checksum = output.split(" ")[0]
-    return {"path": file[1], "checksum": checksum, "returncode": p.returncode, "id": file[2]}
+    return {
+        "path": file[1],
+        "checksum": checksum,
+        "returncode": p.returncode,
+        "id": file[2],
+    }
 
 
 # Our HSI class. This just wraps subprocess+hsi to make it a little easier to manage
@@ -619,12 +762,18 @@ class HSIJob:
         cmd.extend(self.cmd.split(" "))
 
         output = []
-        p = Popen(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True)
+        p = Popen(
+            cmd,
+            stdout=PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True,
+        )
         for line in p.stdout:
-            if 'PASSCODE' in line:
+            if "PASSCODE" in line:
                 print(line)
 
-            output.append(line.strip()) 
+            output.append(line.strip())
         p.wait()
 
         if p.returncode != 0 and self.verbose:
@@ -635,30 +784,76 @@ class HSIJob:
 
         return output, p.returncode
 
-    # Returns the full HSI command that will be run as a string. 
+    # Returns the full HSI command that will be run as a string.
     def getcommand(self):
         cmd = self.hsi.split(" ")
         if self.flags is not None:
             cmd.extend(self.flags.split(" "))
         cmd.extend(self.cmd.split(" "))
-        return ' '.join(cmd)
+        return " ".join(cmd)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('source', help="Top level directory in HPSS to pull files from. This is a recursive action!")
-    parser.add_argument('destination', help="Top level directory on Kronos to put files. An identical directory structure will be created here as exists in HPSS under `source`")
-    parser.add_argument('--dry-run', action='store_true', default=False, help='Generate the file lists but do not actually checksum or transfer files, and output the `hsi` commands that would have been used')
-    parser.add_argument('--db-path', default=None, help='Path to existing db generated by --preserve-db, or from an interrupted job. Picks up where the last job left off')
-    parser.add_argument('--preserve-file-lists', action='store_true', default=False, help='Do not delete the file list generated by this script. Will write the list to the cwd')
-    parser.add_argument('--preserve-db', action='store_true', default=False, help='Do not delete the db cache. This can be useful for restarting an interrupted migration')
-    parser.add_argument('--disable-checksums', action='store_true', default=False, help='Disable the checksumming operation. This can speed things up, but at the cost of not verifying data integrity on the destination')
-    parser.add_argument('--additional-hsi-flags', default=None, help='Additional flags needed to be passed to `hsi`')
-    parser.add_argument('--overwrite-existing', default=False, action='store_true', help='Force overwrite of existing files that match the file names in HPSS')
-    parser.add_argument('--vvs-per-job', help=argparse.SUPPRESS, default=1)
-    parser.add_argument('--checksum-threads', help=argparse.SUPPRESS, default=4)
-    parser.add_argument('--disable-ta', default=False, help=argparse.SUPPRESS, action='store_true')
-    parser.add_argument('--verbose', default=False, help="Output additional information about the transfer", action='store_true')
+    parser.add_argument(
+        "source",
+        help="Top level directory in HPSS to pull files from. This is a recursive action!",
+    )
+    parser.add_argument(
+        "destination",
+        help="Top level directory on Kronos to put files. An identical directory structure will be created here as exists in HPSS under `source`",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Generate the file lists but do not actually checksum or transfer files, and output the `hsi` commands that would have been used",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Path to existing db generated by --preserve-db, or from an interrupted job. Picks up where the last job left off",
+    )
+    parser.add_argument(
+        "--preserve-file-lists",
+        action="store_true",
+        default=False,
+        help="Do not delete the file list generated by this script. Will write the list to the cwd",
+    )
+    parser.add_argument(
+        "--preserve-db",
+        action="store_true",
+        default=False,
+        help="Do not delete the db cache. This can be useful for restarting an interrupted migration",
+    )
+    parser.add_argument(
+        "--disable-checksums",
+        action="store_true",
+        default=False,
+        help="Disable the checksumming operation. This can speed things up, but at the cost of not verifying data integrity on the destination",
+    )
+    parser.add_argument(
+        "--additional-hsi-flags",
+        default=None,
+        help="Additional flags needed to be passed to `hsi`",
+    )
+    parser.add_argument(
+        "--overwrite-existing",
+        default=False,
+        action="store_true",
+        help="Force overwrite of existing files that match the file names in HPSS",
+    )
+    parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1)
+    parser.add_argument("--checksum-threads", help=argparse.SUPPRESS, default=4)
+    parser.add_argument(
+        "--disable-ta", default=False, help=argparse.SUPPRESS, action="store_true"
+    )
+    parser.add_argument(
+        "--verbose",
+        default=False,
+        help="Output additional information about the transfer",
+        action="store_true",
+    )
     parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"
     # Get our cli args
     args = parser.parse_args()
@@ -666,7 +861,7 @@ def main():
     job = MigrateJob(args)
 
     if args.db_path is not None:
-        print("Resuming interrupted transfer.") 
+        print("Resuming interrupted transfer.")
 
     # Populate the db with HPSS data
     if args.db_path is None:
@@ -714,8 +909,10 @@ def main():
 
     # Write the report to a file
     if not args.dry_run:
-        reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(int(time.time()))
-        with open(reportfilename, 'w') as f:
+        reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
+            int(time.time())
+        )
+        with open(reportfilename, "w") as f:
             json.dump(finalreport, f, indent=2)
         print("Transfer complete. Report has been written to {}".format(reportfilename))
 
