@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
+# pylint: disable=R,C
+
 import sys
-import colorlog
 import logging
 import os
 import subprocess
@@ -15,6 +16,7 @@ import json
 
 from enum import Enum
 from alive_progress import alive_it
+
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -117,14 +119,16 @@ class DBCache:
             try:
                 self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
                 self.cur = self.db.cursor()
-            except:
-                logging.critical("Can not open {}. Database may be corrupt".format(self.dbpath))
+            except:  # pylint: disable=bare-except
+                logging.critical(
+                    "Can not open %s. Database may be corrupt", self.dbpath
+                )
                 sys.exit(3)
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
     def __del__(self):
         if self.preservedb:
-            logging.info("DB saved at {}".format(self.dbpath))
+            logging.info("DB saved at %s", self.dbpath)
         else:
             if not self.unmanaged_db:
                 os.remove(self.dbpath)
@@ -227,7 +231,9 @@ class DBCache:
 
                 fileid = self.fileExists(fpath)
                 if fileid is None:
-                    logging.critical("Commit to DB did not work as intended. Internal Error!")
+                    logging.critical(
+                        "Commit to DB did not work as intended. Internal Error!"
+                    )
                     sys.exit(1)
 
                 self._add_to_tx(
@@ -443,7 +449,9 @@ class MigrateJob:
 
         # If --db-path is defined, do not create a new db, use the one at the path provided
         if args.db_path is not None:
-            self.db = DBCache(self.preserve_db, self.verbose, self.output_path, path=args.db_path)
+            self.db = DBCache(
+                self.preserve_db, self.verbose, self.output_path, path=args.db_path
+            )
         else:
             self.db = DBCache(self.preserve_db, self.verbose, self.output_path)
 
@@ -474,11 +482,9 @@ class MigrateJob:
             try:
                 os.mkdir(path[1])
             except FileExistsError:
-                logging.debug(
-                    "Skipping mkdir of {}; directory already exists".format(path[1])
-                )
+                logging.debug("Skipping mkdir of %s; directory already exists", path[1])
                 self.db.markdestcreated(path[0])
-            except:
+            except:  # pylint: disable=bare-except
                 logging.critical(
                     "ERROR: Could not create destination directory. Do you have the correct permissions?"
                 )
@@ -495,7 +501,9 @@ class MigrateJob:
         # Generator to created a chunked list of vv's
         def chunk(lst, chunksize):
             if chunksize < 0 and chunksize != -1:
-                logging.critical("vvs-per-job needs to be either -1 or a positive integer!")
+                logging.critical(
+                    "vvs-per-job needs to be either -1 or a positive integer!"
+                )
                 sys.exit(4)
             if chunksize == -1:
                 yield lst
@@ -517,9 +525,7 @@ class MigrateJob:
             logging.debug(json.dumps(existingFiles, indent=2))
 
         logging.info(
-            "Starting migration of files from {} to {}".format(
-                self.source, self.destination
-            )
+            "Starting migration of files from %s to %s", self.source, self.destination
         )
 
         # Set some variables for status output (esp if not using the progress bar)
@@ -549,7 +555,7 @@ class MigrateJob:
                     self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
                 # Write the infile to be passed into HSI
-                with open(infilename, "w") as infile:
+                with open(infilename, "w", encoding="UTF-8") as infile:
                     getcmd = "get -T on << EOF\n"
                     # hashcreate can not use the TA, so we force -T off
                     hashcreatecmd = "hashcreate -T off << EOF\n"
@@ -583,31 +589,32 @@ class MigrateJob:
                         self.db.markfileasstaging(f[2])
                     # Run the job!
                     output, rc = migration_job.run()
+                    if rc != 0:
+                        logging.info("HSI job failed: returned %d", rc)
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                     for line in output:
                         if "(md5)" in line:
                             checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
                             self.db.setsrcchecksum(srcpath, checksum)
                             self.db.markfileashpsschecksumcomplete(srcpath)
-                            logging.debug("Completed transfer for file {}".format(srcpath))
+                            logging.debug("Completed transfer for file %s", srcpath)
                             self.db.markfileastransfercompleted(srcpath)
                         if "get: Error" in line:
                             logging.info(
-                                "File {} failed to transfer from HPSS".format(
-                                    line.split(" ")[-1]
-                                )
+                                "File %s failed to transfer from HPSS",
+                                line.split(" ")[-1],
                             )
                             self.db.markasfailed(line.split(" ")[-1])
                     # Update our stats
                     filesCompleted += len(files)
                     if self.addl_flags is not None:
                         logging.debug(
-                            "{}/{} file transfers have been attempted".format(
-                                filesCompleted, filesTotal
-                            )
+                            "%s/%s file transfers have been attempted",
+                            filesCompleted,
+                            filesTotal,
                         )
                 else:
-                    logging.info("Would have run: {}".format(migration_job.getcommand()))
+                    logging.info("Would have run: %s", migration_job.getcommand())
 
                 # Remove infile list if we're not worried about preserving
                 if not self.preserve_file_lists:
@@ -636,16 +643,14 @@ class MigrateJob:
         ret["checksum_mismatch"] = []
         if len(files) > 0:
             for file in files:
-                logging.debug("Checksum did not match! Can not guarantee file integrity!")
                 logging.debug(
-                    " - {}({}) : {}({})".format(
-                        files[1], files[2], files[3], files[4]
-                    )
+                    "Checksum did not match! Can not guarantee file integrity!"
                 )
+                logging.debug(" - %s(%s) : %s(%s)", file[1], file[2], file[3], file[4])
                 ret["checksum_mismatch"].append(
                     {
-                        "source": (files[1], files[2]),
-                        "destination": (files[3], files[4]),
+                        "source": (file[1], file[2]),
+                        "destination": (file[3], file[4]),
                     }
                 )
         else:
@@ -685,9 +690,8 @@ class MigrateJob:
         output, rc = self.ls_job.run()
         if rc != 0:
             logging.critical(
-                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in {}!".format(
-                    self.source
-                )
+                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in %s!",
+                self.source,
             )
             sys.exit(5)
 
@@ -719,7 +723,12 @@ def doDestChecksum(file):
 
     output = []
     p = subprocess.run(
-        cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True
+        cmd,
+        stdout=PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        universal_newlines=True,
+        check=False,
     )
 
     output = p.stdout.strip()
@@ -790,13 +799,19 @@ class HSIJob:
         cmd.extend(self.cmd.split(" "))
         return " ".join(cmd)
 
+
 def initLogger(verbose):
     if verbose:
-        #logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
-        logging.basicConfig(level=logging.DEBUG, format='', datefmt='%m/%d/%Y %I:%M:%S %p')
+        # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+        logging.basicConfig(
+            level=logging.DEBUG, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
+        )
     else:
-        #logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
-        logging.basicConfig(level=logging.INFO, format='', datefmt='%m/%d/%Y %I:%M:%S %p')
+        # logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+        logging.basicConfig(
+            level=logging.INFO, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
+        )
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -859,7 +874,9 @@ def main():
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
     parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
-    parser.add_argument("--checksum-threads", help=argparse.SUPPRESS, default=4, type=int)
+    parser.add_argument(
+        "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
+    )
     parser.add_argument(
         "--disable-ta", default=False, help=argparse.SUPPRESS, action="store_true"
     )
@@ -869,7 +886,7 @@ def main():
         help="Output additional information about the transfer",
         action="store_true",
     )
-    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"
+    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments" # pylint: disable=W0212
     # Get our cli args
     args = parser.parse_args()
     initLogger(args.verbose)
@@ -924,9 +941,9 @@ def main():
         reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
             int(time.time())
         )
-        with open(reportfilename, "w") as f:
+        with open(reportfilename, "w", encoding="UTF-8") as f:
             json.dump(finalreport, f, indent=2)
-        logging.info("Transfer complete. Report has been written to {}".format(reportfilename))
+        logging.info("Transfer complete. Report has been written to %s", reportfilename)
 
 
 if __name__ == "__main__":
