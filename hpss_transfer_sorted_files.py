@@ -17,11 +17,29 @@ import json
 from enum import Enum
 from alive_progress import alive_it
 
-
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
 
 # =============================================================================
+# hpss_transfer_sorted_files.py
+#
+# This is a script that wraps HSI and queries HPSS for files and VV location
+# based upon a given HPSS-path. Once queried, it will batch up files based
+# upon VV such that users can more smartly recall data from tape, without
+# causing A) too many tapes/drives being loaded, and B) reduce tape thrashing.
+# By default, only files from a single VV will be transferred to the provded
+# destination directory at a time.
+# Additionally, this script will:
+# * Create the same directory structure that users have on HPSS at the provided
+#   source path
+# * Checksum files on HPSS (after staging from tape) and checksum files once
+#   they have landed in the destination, and ensure that they are the same
+# * Generate a JSON report that users can use to see if there were any failures
+#   or if any files that were skipped, etc
+#
+#
+# Additional Notes:
+#
 # Database statuses
 #
 # File status:
@@ -194,15 +212,17 @@ class DBCache:
         if self.verbose:
             files = alive_it(files)
         for file in files:
-            vv = file[5]
-            fpath = file[1]
+            vv = file[1]
+            fpath = file[0]
             vvid = self.vvExists(vv)
+            # print("DEBUG: ", fpath, srcroot, destroot)
             dest = fpath.replace(srcroot, destroot)
             if not self.fileExists(fpath):
                 if vvid is None:
                     self.insertvv(vv)
                     vvid = self.vvExists(vv)
 
+                # print("DEBUG: ", file, dest)
                 destid = self.getdest(dest)[0]
                 if destid == []:
                     logging.critical("No destination found; Cowardly failing...")
@@ -461,7 +481,7 @@ class MigrateJob:
             self.addl_flags,
             True,
             self.verbose,
-            "ls -R -P {}".format(self.source),
+            "ls -a -N -R -P {}".format(self.source),
         )
 
     # Check the destination filesystem for files that match names at the predicted destination directory
@@ -522,7 +542,11 @@ class MigrateJob:
 
         if len(existingFiles) > 0:
             logging.debug("Found existing files:")
-            logging.debug(json.dumps(existingFiles, indent=2))
+            # Format existingFiles so it looks better
+            existing = []
+            for f in existingFiles:
+                existing.append({"source": f[0], "destination": f[1]})
+            logging.debug(json.dumps(existing, indent=2))
 
         logging.info(
             "Starting migration of files from %s to %s", self.source, self.destination
@@ -685,31 +709,48 @@ class MigrateJob:
 
         return report
 
+    @property
+    def _hpss_root_dir(self):
+        path = self.source
+        while any(char in "*?[]" for char in path):
+            path = os.path.dirname(path)
+        return path
+
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
         output, rc = self.ls_job.run()
-        if rc != 0:
+
+        files = []
+        dirs = set()
+
+        for line in output:
+            s = line.split("\t")
+            # print("DEBUG: ", s)
+            objtype = s[0]
+            # If this is a file entry, save it with the VV, and infer the directory
+            if "FILE" in objtype:
+                file, vv = s[1], s[5]
+                files.append((file, vv))
+                dirs.add(os.path.dirname(file))
+
+        # We're checking the rc here just in case there ARE files that are readable that are returned
+        if rc != 0 and len(files) == 0:
             logging.critical(
                 "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in %s!",
-                self.source,
+                self._hpss_root_dir,
             )
             sys.exit(5)
 
-        files = []
-        dirs = []
-        for i in output:
-            i = i.split("\t")
-            if i[0] == "FILE":
-                files.append(i)
-            elif i[0] == "DIRECTORY":
-                dirs.append(i)
-
+        if len(files) == 0:
+            logging.critical("No in HPSS files matched query: %s", self.source)
+            sys.exit(6)
         # Removing junk from array
-        dirs = [d[1].replace(self.source, self.destination) for d in dirs]
-        # Adding the root destination since files can be at depth 0
+        dirs = [d.replace(self._hpss_root_dir, self.destination) for d in dirs]
+        # Adding the root destination since files can be at depth 0, and we want to make sure its there
         dirs.append(self.destination)
         self.db.insertdesttree(dirs)
-        self.db.insertfiles(files, self.source, self.destination)
+        # print("DEBUG: ", self._hpss_root_dir)
+        self.db.insertfiles(files, self._hpss_root_dir, self.destination)
 
 
 # Due to the fact that multiprocessing is weird, and pickles things that get passed to the pool (including the function itself),
@@ -895,7 +936,7 @@ def main():
         help="Output additional information about the transfer",
         action="store_true",
     )
-    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments" # pylint: disable=W0212
+    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"  # pylint: disable=W0212
     # Get our cli args
     args = parser.parse_args()
     initLogger(args.verbose)
