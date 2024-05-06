@@ -991,6 +991,7 @@ def main():
         reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
             int(time.time())
         )
+        reportfilename = os.path.join(args.preserved_files_path, reportfilename)
         with open(reportfilename, "w", encoding="UTF-8") as f:
             json.dump(finalreport, f, indent=2)
         logging.info("Transfer complete. Report has been written to %s", reportfilename)

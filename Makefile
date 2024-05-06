@@ -16,21 +16,23 @@ dev: prep
 	${PWD}/venv/bin/pex -r requirements.txt -o hpss_transfer_sorted_files_dev --console-script ${PWD}/hpss_transfer_sorted_files.py
 
 prod: prep
-	${PWD}/venv/bin/pex -r requirements.txt -o hpss_transfer_sorted_files --console-script ${DEST}/hpss_transfer_sorted_files/hpss_transfer_sorted_files.py
+	${PWD}/venv/bin/pex -r requirements.txt -o hpss_transfer_sorted_files --console-script ${DEST}/.hpss_transfer_sorted_files_script/hpss_transfer_sorted_files.py
 
 requirements:
 	pip freeze > requirements.txt
 
-install: all
-	# create and set perms for the script directory
-	mkdir -p ${DEST}/hpss_transfer_sorted_files
-	chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files
-	chmod ${DIRPERMS} ${DEST}/hpss_transfer_sorted_files
+script_install:
+	mkdir -p ${DEST}/.hpss_transfer_sorted_files_script
+	#chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files_script
+	#chmod ${DIRPERMS} ${DEST}/hpss_transfer_sorted_files_script
 	# Copy and set perms for the script
-	cp hpss_transfer_sorted_files.py ${DEST}/hpss_transfer_sorted_files/
-	chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files/hpss_transfer_sorted_files.py
-	chmod ${SCRIPTPERMS} ${DEST}/hpss_transfer_sorted_files/hpss_transfer_sorted_files.py
+	cp hpss_transfer_sorted_files.py ${DEST}/.hpss_transfer_sorted_files_script/
+
+install: script_install all
+	# create and set perms for the script directory
+	#chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files_script/hpss_transfer_sorted_files.py
+	#chmod ${SCRIPTPERMS} ${DEST}/hpss_transfer_sorted_files_script/hpss_transfer_sorted_files.py
 	# Copy and set perms for the binary
 	cp hpss_transfer_sorted_files ${DEST}/
-	chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files
-	chmod ${SCRIPTPERMS} ${DEST}/hpss_transfer_sorted_files
+	#chown ${OWNER}:${GROUPOWN} ${DEST}/hpss_transfer_sorted_files
+	#chmod ${SCRIPTPERMS} ${DEST}/hpss_transfer_sorted_files
