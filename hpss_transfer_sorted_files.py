@@ -15,6 +15,22 @@ import time
 import threading
 import json
 
+import sqlalchemy
+from typing import List
+from typing import Optional
+from sqlalchemy import ForeignKey
+from sqlalchemy import func, select
+from sqlalchemy import insert, distinct
+from sqlalchemy import update
+from sqlalchemy import String
+from sqlalchemy import create_engine
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import Session
+from sqlalchemy.orm import Mapped
+from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import relationship
+
 from enum import Enum
 from alive_progress import alive_it
 
@@ -105,6 +121,40 @@ class TransferStatus(Enum):
     failed = 11
     skipped = 12
 
+class Base(DeclarativeBase):
+    pass
+
+class VV(Base):
+    __tablename__ = 'vvs'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    is_tape: Mapped[bool]
+
+class DestTree(Base):
+    __tablename__ = 'desttree'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    path: Mapped[str]
+    created: Mapped[bool]
+
+class Files(Base):
+    __tablename__ = 'files'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    path: Mapped[str]
+    src_checksum: Mapped[str] = mapped_column(nullable=True)
+    dest_checksum: Mapped[str] = mapped_column(nullable=True)
+    checksum_status: Mapped[int]
+    transfer_status: Mapped[int]
+    vv: Mapped[Optional[int]] = mapped_column(ForeignKey("vvs.id"))
+    dest: Mapped[str]
+    destdir: Mapped[Optional[int]] = mapped_column(ForeignKey("desttree.id"))
+    destfileexists: Mapped[bool]
+
+class Destination(Base):
+    __tablename__ = 'destination'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    path: Mapped[str]
+    completed: Mapped[bool]
+    srcfile: Mapped[Optional[int]] = mapped_column(ForeignKey("files.id"))
 
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
@@ -115,65 +165,31 @@ class DBCache:
         self.verbose = verbose
         self.output_path = output_path
         self.preservedb = cleanup
-        self.lock = threading.Lock()
-        self.stmts = []
+
         if path is None:
             self.unmanaged_db = False
             self.dbpath = os.path.join(
                 self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
             )
-            self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
-            self.cur = self.db.cursor()
-
-            self.cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS vvs(id INTEGER PRIMARY KEY,
-                name TEXT,
-                is_tape BOOLEAN)"""
-            )
-            self.cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS desttree(id INTEGER PRIMARY KEY,
-                path TEXT,
-                created BOOLEAN)"""
-            )
-            self.cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,
-                path TEXT,
-                perms TEXT,
-                owner_id INTEGER,
-                group_id INTEGER,
-                src_checksum TEXT,
-                dest_checksum TEXT,
-                checksum_status INTEGER,
-                transfer_status INTEGER,
-                vv INTEGER,
-                dest TEXT,
-                destdir INTEGER,
-                destfileexists BOOLEAN,
-                FOREIGN KEY (vv) REFERENCES vvs(id),
-                FOREIGN KEY (destdir) REFERENCES desttree(id))"""
-            )
-            self.cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS destination(id INTEGER PRIMARY KEY,
-                path TEXT,
-                completed BOOLEAN,
-                srcfile INTEGER,
-                FOREIGN KEY (srcfile) REFERENCES files(id))"""
-            )
         else:
             self.unmanaged_db = True
             self.dbpath = path
-            try:
-                self.db = sqlite3.connect(self.dbpath, check_same_thread=False)
-                self.cur = self.db.cursor()
-            except:  # pylint: disable=bare-except
-                LOGGER.critical(
-                    "Can not open %s. Database may be corrupt", self.dbpath
-                )
-                sys.exit(3)
+
+        #Connect to DB
+        try:
+            self.engine = create_engine(f"sqlite:///{self.dbpath}", echo=False)
+            Base.metadata.create_all(self.engine)
+        except:  # pylint: disable=bare-except
+            LOGGER.critical(
+                "Can not open %s. Database may be corrupt", self.dbpath
+            )
+            sys.exit(3)
+
+        metadata = sqlalchemy.MetaData()
+        self.vvs_tbl = sqlalchemy.Table('vvs', metadata, autoload_with=self.engine)
+        self.files_tbl = sqlalchemy.Table('files', metadata, autoload_with=self.engine)
+        self.desttree_tbl = sqlalchemy.Table('desttree', metadata, autoload_with=self.engine)
+        self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
     def __del__(self):
@@ -183,68 +199,28 @@ class DBCache:
             if not self.unmanaged_db:
                 os.remove(self.dbpath)
 
-    def _execute(self, stmt, args=None):
-        try:
-            self.lock.acquire(True)
-            if args is not None:
-                self.cur.execute(stmt, args)
-            else:
-                self.cur.execute(stmt)
-            self.db.commit()
-        finally:
-            self.lock.release()
-
-    def _add_to_tx(self, stmt, args=None):
-        tmp = (stmt, args)
-        self.stmts.append(tmp)
-
-    def _execute_tx(self):
-        try:
-            self.lock.acquire(True)
-            for stmt in self.stmts:
-                if stmt[1] is not None:
-                    self.cur.execute(stmt[0], stmt[1])
-                else:
-                    self.cur.execute(stmt[0])
-            self.db.commit()
-        finally:
-            self.stmts = []
-            self.lock.release()
-
-    def _get_rows(self, stmt, args=None, maxrows=None):
-        rows = []
-        try:
-            self.lock.acquire(True)
-            if args is not None:
-                res = self.cur.execute(stmt, args)
-            else:
-                res = self.cur.execute(stmt)
-            if maxrows == 1:
-                rows = res.fetchone()
-            else:
-                rows = res.fetchall()
-        finally:
-            self.lock.release()
-        return rows
-
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
         LOGGER.debug("Building destination tree cache table...")
-        if self.verbose:
-            tree = alive_it(tree)
-        for dest in tree:
-            self._add_to_tx(
-                "INSERT INTO desttree (path, created) VALUES (?, 0)", [dest]
-            )
-        self._execute_tx()
+       # if self.verbose:
+       #     tree = alive_it(tree)
+        if len(tree) > 0:
+            with Session(bind=self.engine) as s:
+                s.execute(
+                        insert(DestTree).values(tree)
+                )
+                s.commit()
+    
 
     # Insert file entries into the files table
     def insertfiles(self, files, srcroot, destroot):
         LOGGER.debug("Creating files table from HPSS source...")
-        if self.verbose:
-            files = alive_it(files)
-        for file in files:
-            vv = file[1]
+
+        #TODO: may need to chunk 'files' up
+        files_to_insert = []
+        destination_to_insert = []
+        for file in files[:]:
+            vv = file[1].split(',')[0]
             fpath = file[0]
             vvid = self.vvExists(vv)
             dest = fpath.replace(srcroot, destroot)
@@ -252,216 +228,198 @@ class DBCache:
                 if vvid is None:
                     self.insertvv(vv)
                     vvid = self.vvExists(vv)
+                    if vvid is None:
+                        LOGGER.fatal("Insert of VV failed!")
+                        sys.exit(100)
 
                 destid = self.getdest(dest)[0]
                 if destid == []:
                     LOGGER.critical("No destination found; Cowardly failing...")
                     sys.exit(2)
 
-                self._execute(
-                    """INSERT INTO files (
-                        path, 
-                        vv, 
-                        dest, 
-                        destdir, 
-                        checksum_status, 
-                        transfer_status,
-                        destfileexists) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    [
-                        fpath,
-                        vvid,
-                        dest,
-                        destid,
-                        ChecksumStatus.not_attempted.value,
-                        TransferStatus.not_started.value,
-                        0,
-                    ],
-                )
+                files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False))
+                #destination_to_insert.append(Destination(path=fpath, completed=0, srcfile=fileid))
 
-                fileid = self.fileExists(fpath)
-                if fileid is None:
-                    LOGGER.critical(
-                        "Commit to DB did not work as intended. Internal Error!"
-                    )
-                    sys.exit(1)
-
-                self._add_to_tx(
-                    "INSERT INTO destination (path, completed, srcfile) VALUES (?, ?, ?)",
-                    [fpath, 0, fileid],
-                )
+                files.remove(file)
             else:
                 LOGGER.debug("File already in DB")
-        self._execute_tx()
+
+        # Perform the actual inserts
+        with Session(bind=self.engine) as s:
+            #s.insert(Files).values(files_to_insert)
+            s.add_all(files_to_insert)
+            s.flush()
+            #s.insert(Destination).values(destination_to_insert)
+            s.add_all([ Destination(path=f.path, completed=False, srcfile=f.id) for f in files_to_insert ])
+            s.flush()
+            s.commit()
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
-        rows = self._get_rows(
-            "SELECT path,dest,id FROM files WHERE transfer_status=? AND checksum_status <> ?",
-            [TransferStatus.completed.value, ChecksumStatus.failed.value],
-        )
+        stmt = select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.checksum_status != ChecksumStatus.failed.value).where(Files.transfer_status == TransferStatus.completed.value)
+
+        rows = []
+        with Session(self.engine) as s:
+            #"SELECT path,dest,id FROM files WHERE transfer_status=? AND checksum_status <> ?",
+            rows = s.execute(stmt).fetchall()
+
         return rows
 
     # returns all files that failed transfers
     def getfailedtransfers(self):
-        rows = self._get_rows(
-            "SELECT path,dest FROM files WHERE transfer_status=?",
-            [TransferStatus.failed.value],
-        )
+        stmt = select(Files.path, Files.dest).select_from(Files).where(Files.transfer_status == TransferStatus.failed.value)
+        rows = []
+        with Session(self.engine) as s:
+            #"SELECT path,dest FROM files WHERE transfer_status=?",
+            rows = s.execute(stmt).fetchall()
         return rows
 
     # Gets all files that failed checksumming
     def getfailedchecksums(self):
-        rows = self._get_rows(
-            "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE checksum_status=?",
-            [ChecksumStatus.failed.value],
-        )
+        stmt = select(Files.path, Files.src_checksum, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.failed.value)
+        rows = []
+        with Session(self.engine) as s:
+            #"SELECT path,src_checksum,dest,dest_checksum FROM files WHERE checksum_status=?",
+            rows = s.execute(stmt).fetchall()
         return rows
 
     # Get all files that successfully finished transferrring and checksumming
     def getsuccessfultransfers(self):
-        rows = self._get_rows(
-            "SELECT path,dest,dest_checksum FROM files WHERE checksum_status=? AND transfer_status=?",
-            [ChecksumStatus.completed.value, TransferStatus.completed.value],
-        )
+        stmt = select(Files.path, Files.dest, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.completed.value).where(Files.transfer_status == TransferStatus.completed.value)
+        rows = []
+        with Session(self.engine) as s:
+            #"SELECT path,dest,dest_checksum FROM files WHERE checksum_status=? AND transfer_status=?",
+            rows = s.execute(stmt).fetchall()
         return rows
 
     # Mark a file entry as failed to transfer
     def markasfailed(self, srcpath):
-        self._execute(
-            "UPDATE files SET transfer_status=? WHERE path = ?",
-            [TransferStatus.failed.value, srcpath],
-        )
+        stmt = update(Files).where(Files.path == srcpath).values(transfer_status=TransferStatus.failed.value)
+        with Session(self.engine) as s:
+            #"UPDATE files SET transfer_status=? WHERE path = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Mark a destination driectory as created
     def markdestcreated(self, destid):
-        self._execute("UPDATE desttree SET created=1 WHERE id = ?", [destid])
+        stmt = update(DestTree).values(created=True).where(DestTree.id == destid)
+        with Session(self.engine) as s:
+            #"UPDATE desttree SET created=1 WHERE id = ?"
+            s.execute(stmt)
+            s.commit()
 
     # Marks a file as 'staging' this is more or less equiv to 'transferring'
     def markfileasstaging(self, fileid):
-        self._execute(
-            "UPDATE files SET transfer_status=? WHERE id = ?",
-            [TransferStatus.staging.value, fileid],
-        )
+        stmt = update(Files).values(transfer_status=TransferStatus.staging.value).where(Files.id == fileid)
+        with Session(self.engine) as s:
+            #"UPDATE files SET transfer_status=? WHERE id = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Set the value of the hpss-derived checksum for the file object
     def setsrcchecksum(self, srcpath, checksum):
-        self._execute(
-            "UPDATE files SET src_checksum=? WHERE path = ?", [checksum, srcpath]
-        )
+        stmt = update(Files).values(src_checksum=checksum).where(Files.path == srcpath)
+        with Session(self.engine) as s:
+            #"UPDATE files SET src_checksum=? WHERE path = ?"
+            s.execute(stmt)
+            s.commit()
 
     # Sets the value of the md5sum performed at the destination
     def setdestchecksum(self, fileid, checksum):
-        self._execute(
-            "UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
-        )
+        stmt = update(Files).values(dest_checksum=checksum).where(Files.id == fileid)
+        with Session(self.engine) as s:
+            #"UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
+            s.execute(stmt)
+            s.commit()
 
     # Marks the checksum status of a file as completed
     def markfilechecksumascomplete(self, fileid):
-        self._execute(
-            "UPDATE files SET checksum_status=? WHERE id = ?",
-            [ChecksumStatus.completed.value, fileid],
-        )
+        stmt = update(Files).values(checksum_status=ChecksumStatus.completed.value).where(Files.id == fileid)
+        with Session(self.engine) as s:
+            #"UPDATE files SET checksum_status=? WHERE id = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Marks the checksum status of a file as failed
     def markfilechecksumasfailed(self, fileid):
-        self._execute(
-            "UPDATE files SET checksum_status=? WHERE id = ?",
-            [ChecksumStatus.failed.value, fileid],
-        )
+        stmt = update(Files).values(checksum_status=ChecksumStatus.failed.value).where(Files.id == fileid)
+        with Session(self.engine) as s:
+            #"UPDATE files SET checksum_status=? WHERE id = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Marks the file trasfer as completed
     def markfileastransfercompleted(self, srcpath):
-        self._execute(
-            "UPDATE files SET transfer_status=? WHERE path = ?",
-            [TransferStatus.completed.value, srcpath],
-        )
+        stmt = update(Files).values(transfer_status=TransferStatus.completed.value).where(Files.path == srcpath)
+        with Session(self.engine) as s:
+            #"UPDATE files SET checksum_status=? WHERE id = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Marks the file as hpss_checksum_complete
     def markfileashpsschecksumcomplete(self, srcpath):
-        self._execute(
-            "UPDATE files SET checksum_status=? WHERE path = ?",
-            [ChecksumStatus.hpss_complete.value, srcpath],
-        )
+        stmt = update(Files).values(checksum_status=ChecksumStatus.hpss_complete.value).where(Files.path == srcpath)
+        with Session(self.engine) as s:
+            #"UPDATE files SET checksum_status=? WHERE path = ?",
+            s.execute(stmt)
+            s.commit()
 
     # Inserts a VV into the vvs table
     def insertvv(self, vv):
         istape = False
         if "X" in vv or "H" in vv:
             istape = True
-        self._execute(
-            "INSERT INTO vvs (name, is_tape) VALUES (?, ?)", [vv, int(istape)]
-        )
+        stmt = insert(VV).values(name=vv, is_tape=istape)
+        with Session(self.engine) as s:
+            s.execute(stmt)
+            s.commit()
 
     # Retrieve a vv entry by name
     def getvv(self, vv):
-        rows = self._get_rows("SELECT id, name FROM vvs WHERE name LIKE ?", [vv])
-        return rows
+        row = None
+        with Session(self.engine) as s:
+            row = s.execute(
+                    select(VV.id, VV.name).select_from(VV).where(VV.name==vv)
+            ).one_or_none()
+        return row 
 
     # Get a destination driectory entry by path
     def getdest(self, path):
         dirname = os.path.dirname(path)
-        rows = self._get_rows(
-            "SELECT id, path FROM desttree WHERE path LIKE ?", [dirname]
-        )
-        return rows[0]
-
-    # Get the total number of files in the files table in the db
-    def gettotalnumberoffiles(self):
-        row = self._get_rows("SELECT count(*) FROM files", maxrows=1)
-        return row[0]
+        row = None
+        with Session(self.engine) as s:
+            row = s.execute(
+                    select(DestTree.id, DestTree.path).select_from(DestTree).where(DestTree.path == dirname)
+            ).first()
+        return row if row is not None else []
+#        rows = self._get_rows(
+#            "SELECT id, path FROM desttree WHERE path LIKE ?", [dirname]
+#        )
+#        return rows[0]
 
     # Get file entries where the source and dest checksums do not match
     def getnonmatchingchecksums(self):
-        suffix = "OR (dest_checksum IS NULL AND src_checksum IS NULL AND destfileexists <> 1)"
+        stmt = select(Files.path, Files.src_checksum, Files.dest_checksum).select_from(Files).where(Files.dest_checksum != Files.src_checksum)
+
         if self.disable_checksums:
-            suffix = ""
+            stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where((Files.dest_checksum != Files.src_checksum) | (Files.dest_checksum == None & Files.src_checksum == None & Files.destfileexists == True))
 
-        rows = self._get_rows(
-            "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE dest_checksum <> src_checksum {}".format(suffix) 
-        )
-        return rows
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(stmt).fetchall()
+        #suffix = "OR (dest_checksum IS NULL AND src_checksum IS NULL AND destfileexists <> 1)"
+        #if self.disable_checksums:
+        #    suffix = ""
 
-    # Get files marked as 'destination file exists'
-    def getexistingfiles(self):
-        rows = self._get_rows("SELECT path,dest,id FROM files WHERE destfileexists=1")
-        return rows
-
-    # get a file by source path
-    def getfile(self, file):
-        rows = self._get_rows("SELECT id, path FROM files WHERE path LIKE ?", [file])
-        return rows
-
-    # Get a list of files by VV (DB) id
-    def getfilesbyvv(self, vvid):
-        rows = self._get_rows(
-            "SELECT path,dest,id FROM files WHERE vv = ? AND transfer_status <> ?",
-            [vvid, TransferStatus.completed.value],
-        )
-        return rows
-
-    # Dump the files table
-    def dumpfiles(self):
-        rows = self._get_rows("SELECT * FROM files")
-        return rows
-
-    # Get list of vvs that have non-complete file transfers
-    def getvvswithnoncompletefiles(self):
-        rows = self._get_rows(
-            "SELECT DISTINCT vv FROM files where transfer_status <> ?",
-            [TransferStatus.completed.value],
-        )
-        return rows
-
-    # dump the desttree table
-    def dumpdesttree(self):
-        rows = self._get_rows("SELECT * FROM desttree")
+        #rows = self._get_rows(
+        #    "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE dest_checksum <> src_checksum {}".format(suffix) 
+        #)
         return rows
 
     # vvExists will return None if theres no entries, and the rowid if there is
     def vvExists(self, vv):
-        rows = self.getvv(vv)
-        for row in rows:
+        row = self.getvv(vv)
+        if row is not None:
             if row[1] == vv:
                 return row[0]
         return None
@@ -470,16 +428,76 @@ class DBCache:
     def fileExists(self, file):
         rows = self.getfile(file)
         for row in rows:
-            if row[1] == file:
-                return row[0]
+            if row.path == file:
+                return row.id 
         return None
+
+    # Get the total number of files in the files table in the db
+    def gettotalnumberoffiles(self):
+        row = None
+        with Session(self.engine) as s:
+            row = s.execute(select(func.count('*')).select_from(Files)).one_or_none()
+        return row if row is not None else []
+
+    # Get files marked as 'destination file exists'
+    def getexistingfiles(self):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(
+                    select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.destfileexists==True)
+            ).fetchall()
+        return rows
+    #rows = self._get_rows("SELECT path,dest,id FROM files WHERE destfileexists=1")
+
+    # get a file by source path
+    def getfile(self, file):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(
+                    select(Files.id, Files.path).select_from(Files).where(Files.path == file)
+            ).fetchall()
+        return rows
+    #rows = self._get_rows("SELECT id, path FROM files WHERE path LIKE ?", [file])
+
+    # Get a list of files by VV (DB) id
+    def getfilesbyvv(self, vvid):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(
+                    select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value)
+            ).fetchall()
+        return rows
+
+    # Dump the files table
+    def dumpfiles(self):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(select(Files)).fetchall()
+        return rows
+
+    # Get list of vvs that have non-complete file transfers
+    def getvvswithnoncompletefiles(self):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.execute(
+                    select(distinct(Files.vv)).select_from(Files).where(Files.transfer_status != TransferStatus.completed.value)
+            ).fetchall()
+        return rows
+
+    # dump the desttree table
+    def dumpdesttree(self):
+        rows = []
+        with Session(self.engine) as s:
+            rows = s.query(DestTree).filter(func.length(DestTree.path)).all()
+        return rows
 
     # Mark a file as 'destination file exists'
     def markexists(self, fileid):
-        self._execute(
-            "UPDATE files SET destfileexists=1,transfer_status=? WHERE id=?",
-            [TransferStatus.skipped.value, fileid],
-        )
+        with Session(self.engine) as s:
+            s.execute(
+                    update(Files).values(destfileexists=True, transfer_status=TransferStatus.skipped.value).where(Files.id == fileid)
+            )
+            s.commit()
 
 
 # Object to manage the HSIJobs required for migration of files in the DB
@@ -531,20 +549,20 @@ class MigrateJob:
 
     # Create the destination directory structure
     def createDestTree(self):
-        destpaths = sorted(self.db.dumpdesttree(), key=lambda x: len(x[1]))
+        destpaths = self.db.dumpdesttree()
         for path in destpaths:
             try:
-                os.mkdir(path[1])
+                os.mkdir(path.path)
             except FileExistsError:
-                LOGGER.debug("Skipping mkdir of %s; directory already exists", path[1])
-                self.db.markdestcreated(path[0])
+                LOGGER.debug("Skipping mkdir of %s; directory already exists", path.path)
+                self.db.markdestcreated(path.id)
             except Exception as e:  # pylint: disable=bare-except
                 LOGGER.critical(
-                    "ERROR: Could not create destination directory (%s).\n(%s)", path[1], e
+                    "ERROR: Could not create destination directory (%s).\n(%s)", path.path, e
                 )
                 sys.exit(3)
             else:
-                self.db.markdestcreated(path[0])
+                self.db.markdestcreated(path.id)
 
     def runHashList(self, files):
         infilename = os.path.join(
@@ -630,8 +648,8 @@ class MigrateJob:
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
 
-        if self.addl_flags is None:
-            vvs = alive_it(vvs, monitor=False, stats=False, force_tty=True) #, enrich_print=False)
+        #if self.addl_flags is None:
+        #    vvs = alive_it(vvs, monitor=False, stats=False, force_tty=True) #, enrich_print=False)
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
         for vvlist in vvs:
@@ -826,9 +844,9 @@ class MigrateJob:
             LOGGER.critical("No in HPSS files matched query: %s", self.source)
             sys.exit(6)
         # Removing junk from array
-        dirs = [d.replace(self._hpss_root_dir, self.destination) for d in dirs]
+        dirs = [{"created": False, "path": d.replace(self._hpss_root_dir, self.destination)} for d in dirs]
         # Adding the root destination since files can be at depth 0, and we want to make sure its there
-        dirs.append(self.destination)
+        dirs.append({"created": False, "path": self.destination})
         self.db.insertdesttree(dirs)
         self.db.insertfiles(files, self._hpss_root_dir, self.destination)
 
