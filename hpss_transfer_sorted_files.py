@@ -32,9 +32,9 @@ from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
 
 from enum import Enum
-from alive_progress import alive_it
 
 LOGGER = None
+SELECT_LIMIT = 1
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -201,9 +201,7 @@ class DBCache:
 
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
-        LOGGER.debug("Building destination tree cache table...")
-       # if self.verbose:
-       #     tree = alive_it(tree)
+        LOGGER.debug(f"Batch inserting destination tree into 'desttree' table (num_dirs={len(tree)})...")
         if len(tree) > 0:
             with Session(bind=self.engine) as s:
                 s.execute(
@@ -214,7 +212,7 @@ class DBCache:
 
     # Insert file entries into the files table
     def insertfiles(self, files, srcroot, destroot):
-        LOGGER.debug("Creating files table from HPSS source...")
+        LOGGER.debug(f"Batch inserting files into 'files' table (num_files={len(files)})...")
 
         #TODO: may need to chunk 'files' up
         files_to_insert = []
@@ -462,11 +460,16 @@ class DBCache:
     # Get a list of files by VV (DB) id
     def getfilesbyvv(self, vvid):
         rows = []
+        offset = 0
         with Session(self.engine) as s:
-            rows = s.execute(
-                    select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value)
-            ).fetchall()
-        return rows
+            while True:
+                rows = s.execute(
+                        select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value).order_by(self.files_tbl.c.id).offset(offset).limit(SELECT_LIMIT)
+                ).fetchall()
+                yield rows
+                offset += len(rows)
+                if len(rows) < SELECT_LIMIT:
+                    break
 
     # Dump the files table
     def dumpfiles(self):
@@ -488,6 +491,7 @@ class DBCache:
     def dumpdesttree(self):
         rows = []
         with Session(self.engine) as s:
+            #rows = s.execute(select(DestTree).order_by(func.length(DestTree.path))).fetchall()
             rows = s.query(DestTree).filter(func.length(DestTree.path)).all()
         return rows
 
@@ -552,7 +556,7 @@ class MigrateJob:
         destpaths = self.db.dumpdesttree()
         for path in destpaths:
             try:
-                os.mkdir(path.path)
+                os.makedirs(path.path, exist_ok=True)
             except FileExistsError:
                 LOGGER.debug("Skipping mkdir of %s; directory already exists", path.path)
                 self.db.markdestcreated(path.id)
@@ -582,16 +586,13 @@ class MigrateJob:
         )
 
         if not self.dry_run:
-            output, rc = hashlist_job.run()
-            if rc != 0:
-                LOGGER.info("HSI hashlist job failed: returned %d", rc)
-
             ret = {}
-            for line in output:
-                if "md5" in line:
-                    checksum, srcpath = line.split(" ")[0], line.split(" ")[-2]
-                    LOGGER.debug("Found preexisting hash for file: %s : %s", srcpath, checksum)
-                    ret[srcpath] = checksum
+            for chunk in hashlist_job.run():
+                for line in chunk:
+                    if "md5" in line:
+                        checksum, srcpath = line.split(" ")[0], line.split(" ")[-2]
+                        LOGGER.debug("Found preexisting hash for file: %s : %s", srcpath, checksum)
+                        ret[srcpath] = checksum
 
         return ret
 
@@ -643,57 +644,81 @@ class MigrateJob:
         # Set some variables for status output (esp if not using the progress bar)
         filelistnum = 0
         filesCompleted = len(existingFiles)
-        filesTotal = self.db.gettotalnumberoffiles()
+        filesTotal = self.db.gettotalnumberoffiles()[0]
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
-
-        #if self.addl_flags is None:
-        #    vvs = alive_it(vvs, monitor=False, stats=False, force_tty=True) #, enrich_print=False)
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
         for vvlist in vvs:
             files = []
             # Unpack chunk. Will generally just be a list of 1 vvid, but in case --vvs-per-job is set, this will chunk it up
             for vv in vvlist:
-                files.extend(self.db.getfilesbyvv(vv[0]))
-
-
-            files = [f for f in files if f not in existingFiles]
-
-            # Do a hashlist to get files that have hashes already
-            hashlistout = self.runHashList(files)
-            # if file has hash; save to db
-            self.writeExistingHashes(hashlistout)
-            # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
-            to_hash = [ f for f in files if f[0] not in hashlistout ]
-
-            if len(files) > 0:
                 filelistnum += 1
+                tmpgetfilename = os.path.join(
+                    self.output_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
+                )
+                tmphashfilename = os.path.join(
+                    self.output_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
+                )
                 infilename = os.path.join(
                     self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
-                # Write the infile to be passed into HSI
-                with open(infilename, "w", encoding="UTF-8") as infile:
-                    getcmd = "get -T on << EOF\n"
-                    # hashcreate can not use the TA, so we force -T off
-                    hashcreatecmd = "hashcreate -T off << EOF\n"
+                with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
+                    for chunk in self.db.getfilesbyvv(vv[0]):
+                        files = chunk
+                        files = [f for f in files if f not in existingFiles]
 
+                        # Do a hashlist to get files that have hashes already
+                        hashlistout = self.runHashList(files)
+                        # if file has hash; save to db
+                        self.writeExistingHashes(hashlistout)
+                        # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
+                        to_hash = [ f for f in files if f[0] not in hashlistout ]
+
+
+                        #TODO: Ensure that this does not kill performance
+                        # We're going to be writing multiple gets and hashcreate commands here
+                        # Write each to a separate file, and append to infile at the end?
+                        if len(files) > 0:
+                            getfile.write(
+                                "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
+                            )
+                            getfile.write("\n")
+                            # Add a hashcreate command to generate and get hashes in the same job.
+                            # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
+                            # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
+                            if not self.disable_checksums and len(to_hash) > 0:
+                                hashfile.write("\n".join(["{}".format(f[0]) for f in to_hash]))
+                                hashfile.write("\n")
+
+                # Get the length of the hashfiles
+                hashfilelen = 0
+                with open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                    hashfilelen = sum(1 for _ in hashfile)
+
+                # Combine both the hashfile and getfile here
+                with open(infilename, "w", encoding="UTF-8") as infile, open(tmpgetfilename, "r", encoding="UTF-8") as getfile, open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                    # Write the infile to be passed into HSI
+                    getcmd = "get -T on << EOF\n"
                     if self.disable_ta:
                         getcmd = "get -T off << EOF\n"
 
+                    # hashcreate can not use the TA, so we force -T off
+                    hashcreatecmd = "hashcreate -T off << EOF\n"
                     infile.write(getcmd)
-                    infile.write(
-                        "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
-                    )
-                    infile.write("\nEOF\n")
-                    # Add a hashcreate command to generate and get hashes in the same job.
-                    # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
-                    # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
-                    if not self.disable_checksums and len(to_hash) > 0:
+                    for line in getfile:
+                        infile.write(line)
+                    infile.write("EOF\n")
+                    if not self.disable_checksums and hashfilelen > 0:
                         infile.write(hashcreatecmd)
-                        infile.write("\n".join(["{}".format(f[0]) for f in to_hash]))
-                        infile.write("\nEOF\n")
+                        for hashline in hashfile:
+                            infile.write(hashline)
+                        infile.write("EOF")
+
+                # Remove our tmp files
+                #os.remove(tmphashfilename)
+                #os.remove(tmpgetfilename)
 
                 # This is our HSI job
                 migration_job = HSIJob(
@@ -707,36 +732,35 @@ class MigrateJob:
                     for f in files:
                         self.db.markfileasstaging(f[2])
                     # Run the job!
-                    output, rc = migration_job.run()
-                    if rc != 0:
-                        LOGGER.info("HSI job failed: returned %d", rc)
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
-                    for line in output:
-                        if "(md5)" in line:
-                            checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
-                            self.db.setsrcchecksum(srcpath, checksum)
-                            self.db.markfileashpsschecksumcomplete(srcpath)
+                    last_notif_time = int(time.time())
+                    for chunk in migration_job.run(continueOnFailure=True):
+                        for line in chunk:
+                            if int(time.time()) - last_notif_time >= 30:
+                                LOGGER.info(
+                                    "%s/%s file transfers have been attempted",
+                                    filesCompleted,
+                                    filesTotal,
+                                )
+                            if "(md5)" in line:
+                                checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
+                                self.db.setsrcchecksum(srcpath, checksum)
+                                self.db.markfileashpsschecksumcomplete(srcpath)
 
-                        matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
-                        if matches:
-                            srcpath = matches.group(2)
-                            LOGGER.info("Processed file: %s", srcpath)
-                            self.db.markfileastransfercompleted(srcpath)
+                            matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
+                            if matches:
+                                srcpath = matches.group(2)
+                                filesCompleted += 1
+                                LOGGER.debug("Processed file (%s/%s): %s", filesCompleted, filesTotal, srcpath)
+                                self.db.markfileastransfercompleted(srcpath)
 
-                        if "get: Error" in line:
-                            LOGGER.info(
-                                "File %s failed to transfer from HPSS",
-                                line.split(" ")[-1],
-                            )
-                            self.db.markasfailed(line.split(" ")[-1])
+                            if "get: Error" in line:
+                                LOGGER.error(
+                                    "File %s failed to transfer from HPSS",
+                                    line.split(" ")[-1],
+                                )
+                                self.db.markasfailed(line.split(" ")[-1])
                     # Update our stats
-                    filesCompleted += len(files)
-                    if self.addl_flags is not None:
-                        LOGGER.debug(
-                            "%s/%s file transfers have been attempted",
-                            filesCompleted,
-                            filesTotal,
-                        )
                 else:
                     LOGGER.info("Would have run: %s", migration_job.getcommand())
 
@@ -818,37 +842,28 @@ class MigrateJob:
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
-        output, rc = self.ls_job.run()
+        for chunk in self.ls_job.run(): # TODO: move ls_job.run() here to consume files as they're output
+            files = []
+            dirs = set()
 
-        files = []
-        dirs = set()
+            for line in chunk:
+                s = line.split("\t")
+                objtype = s[0]
+                # If this is a file entry, save it with the VV, and infer the directory
+                if "FILE" in objtype:
+                    file, vv = s[1], s[5]
+                    files.append((file, vv))
+                    dirs.add(os.path.dirname(file))
 
-        for line in output:
-            s = line.split("\t")
-            objtype = s[0]
-            # If this is a file entry, save it with the VV, and infer the directory
-            if "FILE" in objtype:
-                file, vv = s[1], s[5]
-                files.append((file, vv))
-                dirs.add(os.path.dirname(file))
-
-        # We're checking the rc here just in case there ARE files that are readable that are returned
-        if rc != 0 and len(files) == 0:
-            LOGGER.critical(
-                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions in %s!",
-                self._hpss_root_dir,
-            )
-            sys.exit(5)
-
-        if len(files) == 0:
-            LOGGER.critical("No in HPSS files matched query: %s", self.source)
-            sys.exit(6)
-        # Removing junk from array
-        dirs = [{"created": False, "path": d.replace(self._hpss_root_dir, self.destination)} for d in dirs]
-        # Adding the root destination since files can be at depth 0, and we want to make sure its there
-        dirs.append({"created": False, "path": self.destination})
-        self.db.insertdesttree(dirs)
-        self.db.insertfiles(files, self._hpss_root_dir, self.destination)
+            if len(files) == 0:
+                LOGGER.critical("No in HPSS files matched query: %s", self.source)
+                sys.exit(6)
+            # Removing junk from array
+            dirs = [{"created": False, "path": d.replace(self._hpss_root_dir, self.destination)} for d in dirs]
+            # Adding the root destination since files can be at depth 0, and we want to make sure its there
+            dirs.append({"created": False, "path": self.destination})
+            self.db.insertdesttree(dirs)
+            self.db.insertfiles(files, self._hpss_root_dir, self.destination)
 
 
 # Due to the fact that multiprocessing is weird, and pickles things that get passed to the pool (including the function itself),
@@ -901,7 +916,7 @@ class HSIJob:
     # This will run HSI and capture any output EXCEPT for the passcode prompt, if the user so wanted to use RSA auth and not keytabs
     # If you're reading this, PLEASE tell the user they should just use keytabs. Their life will be easier. Our life will be eaiser.
     # Puppies will befriend kittens and the world will be at peace.
-    def run(self):
+    def run(self, continueOnFailure=False):
         cmd = self.hsi.split(" ")
         if self.flags is not None:
             cmd.extend(self.flags.split(" "))
@@ -915,20 +930,46 @@ class HSIJob:
             bufsize=1,
             universal_newlines=True,
         )
+        errline = ""
+        encountered_err = False
+        ignore_rc = False
         for line in p.stdout:
             if "PASSCODE" in line:
                 print(line)
+            if encountered_err is True and ".Trash" in line:
+                ignore_rc = True
+                encountered_err = False
+                errline = ""
+            elif encountered_err is True and ".Trash" not in line:
+                LOGGER.error('\n'.join([errline, line]))
+                encountered_err = False
+                errline = ""
 
+            if "***" in line and "HPSS_E" in line:
+                encountered_err = True
+                errline = line
+
+            #TODO: Don't append all lines to output.
+            # Use output as a buffer, and maybe yield the buffer to the parent function
+            # Where the output is processed as it comes in. 
             output.append(line.strip())
+            if len(output) >= 1024:
+                yield output
+                output.clear()
         p.wait()
 
-        if p.returncode != 0:
-            LOGGER.debug("\n")
-            for i in output:
-                LOGGER.debug(i)
-            LOGGER.debug("\n")
+        if p.returncode != 0 and not ignore_rc:
+            LOGGER.fatal(f"HSI failed to run! Returned rc={p.returncode}")
+            LOGGER.fatal(
+                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions!",
+            )
+            for line in output:
+                LOGGER.debug(line)
+            if not continueOnFailure:
+                sys.exit(101)
 
-        return output, p.returncode
+        if len(output) > 0:
+            yield output
 
     # Returns the full HSI command that will be run as a string.
     def getcommand(self):
@@ -1054,6 +1095,7 @@ def main():
     # Get our cli args
     args = parser.parse_args()
     initLogger(args.verbose)
+    LOGGER.info("Starting sorted batch transfer from HPSS (%s) to destination (%s)", args.source, args.destination)
     # Create our migration job
     job = MigrateJob(args)
 
@@ -1062,16 +1104,16 @@ def main():
 
     # Populate the db with HPSS data
     if args.db_path is None:
-        LOGGER.debug("Getting file data from HPSS...")
+        LOGGER.info("Getting file data from HPSS...")
         job.getSrcFiles()
 
     # Check for files that exist in the destination
-    LOGGER.debug("Checking for existing files...")
+    LOGGER.info("Checking for existing files...")
     job.checkForExisting()
 
     # Create the destination directory structure
     if not args.dry_run:
-        LOGGER.debug("Creating destination directory structure")
+        LOGGER.info("Creating destination directory structure")
         job.createDestTree()
 
     # Create our main threads here. One for migration, the other for checksumming
