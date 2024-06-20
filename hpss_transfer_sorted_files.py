@@ -717,8 +717,8 @@ class MigrateJob:
                         infile.write("EOF")
 
                 # Remove our tmp files
-                #os.remove(tmphashfilename)
-                #os.remove(tmpgetfilename)
+                os.remove(tmphashfilename)
+                os.remove(tmpgetfilename)
 
                 # This is our HSI job
                 migration_job = HSIJob(
