@@ -2,22 +2,20 @@
 
 # pylint: disable=R,C
 
-import sys
-import re
+import argparse
+import json
 import logging
 import os
-import subprocess
-from multiprocessing.pool import ThreadPool as Pool
-from subprocess import Popen, PIPE
-import argparse
-import sqlite3
-import time
-import threading
-import json
-
+import re
 import sqlalchemy
-from typing import List
-from typing import Optional
+import sys
+import threading
+import time
+import tracemalloc
+
+from enum import Enum
+from multiprocessing.pool import ThreadPool as Pool
+from subprocess import Popen, PIPE, run, STDOUT
 from sqlalchemy import ForeignKey
 from sqlalchemy import func, select
 from sqlalchemy import insert, distinct
@@ -30,11 +28,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
+from typing import List
+from typing import Optional
 
-from enum import Enum
 
 LOGGER = None
-SELECT_LIMIT = 1
+PROFILER = None
+DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
+CACHE = None
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -130,6 +131,16 @@ class VV(Base):
     name: Mapped[str]
     is_tape: Mapped[bool]
 
+class State(Base):
+    __tablename__ = 'state'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    schema_version: Mapped[int]
+    indexing_complete: Mapped[bool]
+    filelists_complete: Mapped[bool]
+    filelist_name: Mapped[str]
+    filelist_count: Mapped[int]
+
+
 class DestTree(Base):
     __tablename__ = 'desttree'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -139,7 +150,7 @@ class DestTree(Base):
 class Files(Base):
     __tablename__ = 'files'
     id: Mapped[int] = mapped_column(primary_key=True)
-    path: Mapped[str]
+    path: Mapped[str] = mapped_column(sqlite_on_conflict_unique="IGNORE", unique=True)
     src_checksum: Mapped[str] = mapped_column(nullable=True)
     dest_checksum: Mapped[str] = mapped_column(nullable=True)
     checksum_status: Mapped[int]
@@ -149,39 +160,105 @@ class Files(Base):
     destdir: Mapped[Optional[int]] = mapped_column(ForeignKey("desttree.id"))
     destfileexists: Mapped[bool]
 
-class Destination(Base):
-    __tablename__ = 'destination'
-    id: Mapped[int] = mapped_column(primary_key=True)
-    path: Mapped[str]
-    completed: Mapped[bool]
-    srcfile: Mapped[Optional[int]] = mapped_column(ForeignKey("files.id"))
+#
+# Meta-class to track database and filelists created and to package them into an archive in case of interruption
+#
+# TODO: 
+#     *  Change all Database and MigrationJob, etc to grab paths for db or filelist_root_path from the global CACHE
+#     *  Implement pack and unpack
+#     *  Add a Cache.pack() for when ANYTHING interrupts it. Like a global try, catch or something. Esp ctrl+c
+#     *  Implement state table to track if indexing, checksumming, etc has finished. This is to protect against 
+#           Interruption of indexing or checksumming operations
+#     *  Implement updating the state table
+#     *  Users should never care about the cache contents; just where the cache *is* or where the cache *wll be*
+#     *  Rename flags, etc to remove references to 'db' and replace with 'cache'
+#     *  Cache packing should be the LAST thing to happen ANYWHERE ANYTIME
+#     *  Also, do not pack the output report in the cache. Just place this in the output_path (--preserved-files-path?)
+#     *  Report output path should also be gotten from the CACHE object. Basically, this object will track all output files
+#           that are not part of the actual user data from HPSS
+#     *  Maybe use the state table to cache what flags it was run with? That way a user can restart a transfer with something like:
+#           ./script.py --cache-path path/to.cache --last-args
+#     *  Maybe have a new entry for each attempt of the run in the state table. Last state is always the row with the highest id
+#     *  Allows generation of a report to show each attempt and what the last state was
+#     *  ^^^^ This may be too much. Not sure we care enough to do this....
+#     *  Remove these comments and reformat code
+#       
+class Cache:
+    def __init__(self, verbose, output_path, cleanup_filelists=False, cleanup_db=False, existing_path=None, debug=False):
+        self.verbose = verbose 
+        self.output_path = output_path
+        self.cleanup_filelists = cleanup_filelists
+        self.cleanup_db = cleanup_db
+        self.existing_path = existing_path
+        self.debug = debug
+
+        self.filelists = []
+        if self.existing_path is None:
+            self.archive_path = os.path.join(
+                self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.cache"
+            )
+            self.dbpath = os.path.join(self.archive_path, "database.db")
+            self.filelists_root_path = os.path.join(self.archive_path, "filelists")
+        else:
+            self.archive_path = self.existing_path
+            self.unpack()
+            self.dbpath = os.path.join(
+                self.existing_path, "database.db"
+            )
+            self.filelists_root_path = os.path.join(self.archive_path, "filelists")
+
+
+    def get_db_path(self):
+        return self.dbpath
+
+    def archive(self):
+        # TODO: tar self.archive_path and place into output_path
+        pass
+
+    def unpack(self):
+        # TODO: Untar self.archive_path into output_path
+        pass
+
+    def get_unpacked_db_path(self):
+        return self.dbpath
+
+    def get_unpacked_filelist_root_path(self):
+        return self.filelists_root_path
+
+    def get_unpacked_archive_path(self):
+        return self.archive_path
 
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
-class DBCache:
-    def __init__(self, cleanup, verbose, output_path, disable_checksums, path=None):
+class Database:
+    def __init__(self, cleanup, verbose, output_path, disable_checksums, path=None, debug=False):
         self.disable_checksums = disable_checksums
         self.verbose = verbose
         self.output_path = output_path
         self.preservedb = cleanup
+        self.vvs = {}
+        self.desttrees = {}
+        self.debug = debug
 
         if path is None:
             self.unmanaged_db = False
             self.dbpath = os.path.join(
                 self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
             )
+            CACHE.add_db(self.dbpath)
         else:
             self.unmanaged_db = True
             self.dbpath = path
+            CACHE.add_db(self.dbpath, packed=True)
 
         #Connect to DB
         try:
-            self.engine = create_engine(f"sqlite:///{self.dbpath}", echo=False)
+            self.engine = create_engine(f"sqlite:///{self.dbpath}", echo=self.debug)
             Base.metadata.create_all(self.engine)
-        except:  # pylint: disable=bare-except
+        except Exception as e:  # pylint: disable=bare-except
             LOGGER.critical(
-                "Can not open %s. Database may be corrupt", self.dbpath
+                    "Can not open %s. Database may be corrupt: %s", self.dbpath, e
             )
             sys.exit(3)
 
@@ -189,7 +266,7 @@ class DBCache:
         self.vvs_tbl = sqlalchemy.Table('vvs', metadata, autoload_with=self.engine)
         self.files_tbl = sqlalchemy.Table('files', metadata, autoload_with=self.engine)
         self.desttree_tbl = sqlalchemy.Table('desttree', metadata, autoload_with=self.engine)
-        self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
+        #self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
     def __del__(self):
@@ -202,12 +279,21 @@ class DBCache:
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
         LOGGER.debug(f"Batch inserting destination tree into 'desttree' table (num_dirs={len(tree)})...")
-        if len(tree) > 0:
-            with Session(bind=self.engine) as s:
-                s.execute(
-                        insert(DestTree).values(tree)
-                )
-                s.commit()
+        try:
+            if len(tree) > 0:
+                with Session(bind=self.engine) as s:
+                    s.add_all(tree)
+                    #s.execute(
+                    #        insert(DestTree).values(tree)
+                    #)
+                    s.flush()
+                    for t in tree:
+                        self.desttrees[t.path] = t.id
+                    s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath} (insertdesttree)")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
     
 
     # Insert file entries into the files table
@@ -220,37 +306,42 @@ class DBCache:
         for file in files[:]:
             vv = file[1].split(',')[0]
             fpath = file[0]
-            vvid = self.vvExists(vv)
+            if len(vv) != 8:
+                LOGGER.debug(f"No VV found for file {fpath}; skipping and will not track!")
+                LOGGER.error(f"Could not read HPSS metadata for file {fpath}; skipping...")
+                continue
+            vvid = self.vvExists(vv) 
             dest = fpath.replace(srcroot, destroot)
-            if not self.fileExists(fpath):
+            #if not self.fileExists(fpath): # This does a select for each file
+            if vvid is None:
+                self.insertvv(vv)
+                vvid = self.vvExists(vv) 
                 if vvid is None:
-                    self.insertvv(vv)
-                    vvid = self.vvExists(vv)
-                    if vvid is None:
-                        LOGGER.fatal("Insert of VV failed!")
-                        sys.exit(100)
+                    LOGGER.fatal("Insert of VV failed!")
+                    sys.exit(100)
 
-                destid = self.getdest(dest)[0]
-                if destid == []:
-                    LOGGER.critical("No destination found; Cowardly failing...")
-                    sys.exit(2)
+            destid = self.getdest(dest)[0] # This can do a select for each file
+            if destid == []:
+                LOGGER.critical("No destination found; Cowardly failing...")
+                sys.exit(2)
 
-                files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False))
-                #destination_to_insert.append(Destination(path=fpath, completed=0, srcfile=fileid))
+            files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False))
 
-                files.remove(file)
-            else:
-                LOGGER.debug("File already in DB")
+            files.remove(file)
 
         # Perform the actual inserts
-        with Session(bind=self.engine) as s:
-            #s.insert(Files).values(files_to_insert)
-            s.add_all(files_to_insert)
-            s.flush()
-            #s.insert(Destination).values(destination_to_insert)
-            s.add_all([ Destination(path=f.path, completed=False, srcfile=f.id) for f in files_to_insert ])
-            s.flush()
-            s.commit()
+        try:
+            with Session(bind=self.engine) as s:
+                s.add_all(files_to_insert)
+                s.flush()
+                #s.insert(Destination).values(destination_to_insert)
+                #s.add_all([ Destination(path=f.path, completed=False, srcfile=f.id) for f in files_to_insert ])
+                s.flush()
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
@@ -293,84 +384,143 @@ class DBCache:
     # Mark a file entry as failed to transfer
     def markasfailed(self, srcpath):
         stmt = update(Files).where(Files.path == srcpath).values(transfer_status=TransferStatus.failed.value)
-        with Session(self.engine) as s:
-            #"UPDATE files SET transfer_status=? WHERE path = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET transfer_status=? WHERE path = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Mark a destination driectory as created
     def markdestcreated(self, destid):
         stmt = update(DestTree).values(created=True).where(DestTree.id == destid)
-        with Session(self.engine) as s:
-            #"UPDATE desttree SET created=1 WHERE id = ?"
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE desttree SET created=1 WHERE id = ?"
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
+
 
     # Marks a file as 'staging' this is more or less equiv to 'transferring'
     def markfileasstaging(self, fileid):
         stmt = update(Files).values(transfer_status=TransferStatus.staging.value).where(Files.id == fileid)
-        with Session(self.engine) as s:
-            #"UPDATE files SET transfer_status=? WHERE id = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET transfer_status=? WHERE id = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Set the value of the hpss-derived checksum for the file object
     def setsrcchecksum(self, srcpath, checksum):
         stmt = update(Files).values(src_checksum=checksum).where(Files.path == srcpath)
-        with Session(self.engine) as s:
-            #"UPDATE files SET src_checksum=? WHERE path = ?"
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET src_checksum=? WHERE path = ?"
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Sets the value of the md5sum performed at the destination
     def setdestchecksum(self, fileid, checksum):
         stmt = update(Files).values(dest_checksum=checksum).where(Files.id == fileid)
-        with Session(self.engine) as s:
-            #"UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Marks the checksum status of a file as completed
     def markfilechecksumascomplete(self, fileid):
         stmt = update(Files).values(checksum_status=ChecksumStatus.completed.value).where(Files.id == fileid)
-        with Session(self.engine) as s:
-            #"UPDATE files SET checksum_status=? WHERE id = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET checksum_status=? WHERE id = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Marks the checksum status of a file as failed
     def markfilechecksumasfailed(self, fileid):
         stmt = update(Files).values(checksum_status=ChecksumStatus.failed.value).where(Files.id == fileid)
-        with Session(self.engine) as s:
-            #"UPDATE files SET checksum_status=? WHERE id = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET checksum_status=? WHERE id = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
+
 
     # Marks the file trasfer as completed
     def markfileastransfercompleted(self, srcpath):
         stmt = update(Files).values(transfer_status=TransferStatus.completed.value).where(Files.path == srcpath)
-        with Session(self.engine) as s:
-            #"UPDATE files SET checksum_status=? WHERE id = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET checksum_status=? WHERE id = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Marks the file as hpss_checksum_complete
     def markfileashpsschecksumcomplete(self, srcpath):
         stmt = update(Files).values(checksum_status=ChecksumStatus.hpss_complete.value).where(Files.path == srcpath)
-        with Session(self.engine) as s:
-            #"UPDATE files SET checksum_status=? WHERE path = ?",
-            s.execute(stmt)
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                #"UPDATE files SET checksum_status=? WHERE path = ?",
+                s.execute(stmt)
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Inserts a VV into the vvs table
     def insertvv(self, vv):
         istape = False
         if "X" in vv or "H" in vv:
             istape = True
-        stmt = insert(VV).values(name=vv, is_tape=istape)
-        with Session(self.engine) as s:
-            s.execute(stmt)
-            s.commit()
+        v = VV(name=vv, is_tape=istape)
+        #stmt = insert(VV).values(name=vv, is_tape=istape)
+        try:
+            with Session(self.engine) as s:
+                #s.execute(stmt)
+                s.add(v)
+                s.flush()
+                self.vvs[vv] = v.id
+                s.commit()
+                #row = s.execute(select(VV.id).select_from(VV).where(VV.name == vv)).fetchall()
+                #self.vvs[vv] = row[0]
+
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
     # Retrieve a vv entry by name
     def getvv(self, vv):
@@ -381,15 +531,23 @@ class DBCache:
             ).one_or_none()
         return row 
 
+    def desttreeexists(self, path):
+        if path in self.desttrees:
+            return True 
+        return False
+
     # Get a destination driectory entry by path
     def getdest(self, path):
         dirname = os.path.dirname(path)
-        row = None
-        with Session(self.engine) as s:
-            row = s.execute(
-                    select(DestTree.id, DestTree.path).select_from(DestTree).where(DestTree.path == dirname)
-            ).first()
-        return row if row is not None else []
+        if dirname in self.desttrees:
+            return [ self.desttrees[dirname] ]
+        else:
+            row = None
+            with Session(self.engine) as s:
+                row = s.execute(
+                        select(DestTree.id, DestTree.path).select_from(DestTree).where(DestTree.path == dirname)
+                ).first()
+            return row if row is not None else []
 #        rows = self._get_rows(
 #            "SELECT id, path FROM desttree WHERE path LIKE ?", [dirname]
 #        )
@@ -416,11 +574,16 @@ class DBCache:
 
     # vvExists will return None if theres no entries, and the rowid if there is
     def vvExists(self, vv):
-        row = self.getvv(vv)
-        if row is not None:
-            if row[1] == vv:
-                return row[0]
-        return None
+        if vv not in self.vvs:
+            return None
+        else:
+            return self.vvs[vv]
+
+        #row = self.getvv(vv)
+        #if row is not None:
+        #    if row[1] == vv:
+        #        return row[0]
+        #return None
 
     # fileExists will return None if theres no entries, and the rowid if there is
     def fileExists(self, file):
@@ -464,11 +627,11 @@ class DBCache:
         with Session(self.engine) as s:
             while True:
                 rows = s.execute(
-                        select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value).order_by(self.files_tbl.c.id).offset(offset).limit(SELECT_LIMIT)
+                        select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value).order_by(self.files_tbl.c.id).offset(offset).limit(DB_TX_SIZE)
                 ).fetchall()
                 yield rows
                 offset += len(rows)
-                if len(rows) < SELECT_LIMIT:
+                if len(rows) < DB_TX_SIZE:
                     break
 
     # Dump the files table
@@ -497,11 +660,16 @@ class DBCache:
 
     # Mark a file as 'destination file exists'
     def markexists(self, fileid):
-        with Session(self.engine) as s:
-            s.execute(
-                    update(Files).values(destfileexists=True, transfer_status=TransferStatus.skipped.value).where(Files.id == fileid)
-            )
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                s.execute(
+                        update(Files).values(destfileexists=True, transfer_status=TransferStatus.skipped.value).where(Files.id == fileid)
+                )
+                s.commit()
+        except Exception as e:
+            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.debug(f"{e}")
+            sys.exit(111)
 
 
 # Object to manage the HSIJobs required for migration of files in the DB
@@ -525,11 +693,11 @@ class MigrateJob:
 
         # If --db-path is defined, do not create a new db, use the one at the path provided
         if args.db_path is not None:
-            self.db = DBCache(
-                self.preserve_db, self.verbose, self.output_path, self.disable_checksums, path=args.db_path
+            self.db = Database(
+                self.preserve_db, self.verbose, self.output_path, self.disable_checksums, path=args.db_path, debug=args.debug
             )
         else:
-            self.db = DBCache(self.preserve_db, self.verbose, self.output_path, self.disable_checksums)
+            self.db = Database(self.preserve_db, self.verbose, self.output_path, self.disable_checksums, debug=args.debug)
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -585,8 +753,8 @@ class MigrateJob:
             "in {}".format(infilename),
         )
 
+        ret = {}
         if not self.dry_run:
-            ret = {}
             for chunk in hashlist_job.run():
                 for line in chunk:
                     if "md5" in line:
@@ -637,8 +805,8 @@ class MigrateJob:
                 existing.append({"source": f[0], "destination": f[1]})
             LOGGER.debug(json.dumps(existing, indent=2))
 
-        LOGGER.info(
-            "Starting migration of files from %s to %s", self.source, self.destination
+        LOGGER.debug(
+            "Creating file lists from indexed HPSS data..."
         )
 
         # Set some variables for status output (esp if not using the progress bar)
@@ -666,6 +834,7 @@ class MigrateJob:
                 )
                 with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
                     for chunk in self.db.getfilesbyvv(vv[0]):
+                        LOGGER.debug("Writing chunk of %s to temporary file list...", DB_TX_SIZE)
                         files = chunk
                         files = [f for f in files if f not in existingFiles]
 
@@ -699,6 +868,7 @@ class MigrateJob:
 
                 # Combine both the hashfile and getfile here
                 with open(infilename, "w", encoding="UTF-8") as infile, open(tmpgetfilename, "r", encoding="UTF-8") as getfile, open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                    LOGGER.debug("Combining temporary file lists")
                     # Write the infile to be passed into HSI
                     getcmd = "get -T on << EOF\n"
                     if self.disable_ta:
@@ -717,6 +887,7 @@ class MigrateJob:
                         infile.write("EOF")
 
                 # Remove our tmp files
+                LOGGER.debug("Removing temporary file lists")
                 os.remove(tmphashfilename)
                 os.remove(tmpgetfilename)
 
@@ -728,15 +899,20 @@ class MigrateJob:
                     self.verbose,
                     "in {}".format(infilename),
                 )
+                LOGGER.info(
+                    "Starting migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
+                )
                 if not self.dry_run:
                     for f in files:
                         self.db.markfileasstaging(f[2])
                     # Run the job!
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                     last_notif_time = int(time.time())
+                    first_iter = True
                     for chunk in migration_job.run(continueOnFailure=True):
                         for line in chunk:
-                            if int(time.time()) - last_notif_time >= 30:
+                            if int(time.time()) - last_notif_time >= 30 or first_iter:
+                                first_iter = False
                                 LOGGER.info(
                                     "%s/%s file transfers have been attempted",
                                     filesCompleted,
@@ -760,6 +936,7 @@ class MigrateJob:
                                     line.split(" ")[-1],
                                 )
                                 self.db.markasfailed(line.split(" ")[-1])
+                    PROFILER.snapshot()
                     # Update our stats
                 else:
                     LOGGER.info("Would have run: %s", migration_job.getcommand())
@@ -842,7 +1019,7 @@ class MigrateJob:
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
-        for chunk in self.ls_job.run(): # TODO: move ls_job.run() here to consume files as they're output
+        for chunk in self.ls_job.run(): 
             files = []
             dirs = set()
 
@@ -859,15 +1036,19 @@ class MigrateJob:
                 LOGGER.critical("No in HPSS files matched query: %s", self.source)
                 sys.exit(6)
             # Removing junk from array
-            dirs = [{"created": False, "path": d.replace(self._hpss_root_dir, self.destination)} for d in dirs]
+            dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in self.db.desttrees ]
             # Adding the root destination since files can be at depth 0, and we want to make sure its there
-            dirs.append({"created": False, "path": self.destination})
-            self.db.insertdesttree(dirs)
-            self.db.insertfiles(files, self._hpss_root_dir, self.destination)
+            if self.destination not in self.db.desttrees:
+                dirs.append(DestTree(created=False, path=self.destination))
+            if len(dirs) > 0:
+                self.db.insertdesttree(dirs)
+            if len(files) > 0:
+                self.db.insertfiles(files, self._hpss_root_dir, self.destination)
+        PROFILER.snapshot()
 
 
 # Due to the fact that multiprocessing is weird, and pickles things that get passed to the pool (including the function itself),
-# and the fact that the MigrationJob object contains a DBCache object that contains non-serializable data (thread locks), we go
+# and the fact that the MigrationJob object contains a Database object that contains non-serializable data (thread locks), we go
 # ahead and play it safe and pull this function outside the object. Yay.
 # This function performs a single md5sum on a single file in the destination. Thread pool worker
 def doDestChecksum(file):
@@ -876,10 +1057,10 @@ def doDestChecksum(file):
     cmd = "md5sum {}".format(file[1]).split(" ")
 
     output = []
-    p = subprocess.run(
+    p = run(
         cmd,
         stdout=PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=STDOUT,
         bufsize=1,
         universal_newlines=True,
         check=False,
@@ -926,7 +1107,7 @@ class HSIJob:
         p = Popen(
             cmd,
             stdout=PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=STDOUT,
             bufsize=1,
             universal_newlines=True,
         )
@@ -953,9 +1134,10 @@ class HSIJob:
             # Use output as a buffer, and maybe yield the buffer to the parent function
             # Where the output is processed as it comes in. 
             output.append(line.strip())
-            if len(output) >= 1024:
+            if len(output) >= DB_TX_SIZE:
                 yield output
                 output.clear()
+
         p.wait()
 
         if p.returncode != 0 and not ignore_rc:
@@ -968,6 +1150,7 @@ class HSIJob:
             if not continueOnFailure:
                 sys.exit(101)
 
+        PROFILER.snapshot()
         if len(output) > 0:
             yield output
 
@@ -1008,6 +1191,33 @@ def initLogger(verbose):
         #    level=logging.INFO, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
         #)
 
+class Profiler():
+    def __init__(self, trace):
+        self.trace = trace
+        if trace:
+            tracemalloc.start(10)
+        
+    def snapshot(self):
+        if self.trace: 
+            self.snap = tracemalloc.take_snapshot()
+
+    def print_report(self):
+        if self.trace: 
+            snap = self.snap
+            idx = 0
+            for stats in snap.statistics("lineno"):  
+                print(f"========== SNAPSHOT {idx} =============")  
+                print(stats)  
+                print(stats.traceback.format())  
+                idx += 1
+              
+            print("\n=========== USEFUL METHODS ===========")  
+            print("\nTraceback Limit : ", tracemalloc.get_traceback_limit(), " Frames")  
+              
+            print("\nTraced Memory (Current, Peak): ", tracemalloc.get_traced_memory())  
+              
+            print("\nMemory Usage by tracemalloc Module : ", tracemalloc.get_tracemalloc_memory(), " bytes")  
+                  
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1082,7 +1292,16 @@ def main():
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
     )
     parser.add_argument(
+        "--debug", default=False, help=argparse.SUPPRESS, action="store_true"
+    )
+    parser.add_argument(
         "-T", "--disable-ta", default=False, help=argparse.SUPPRESS, action="store_true"
+    )
+    parser.add_argument(
+        "-s", "--db-tx-size", help=argparse.SUPPRESS, default=9000, type=int
+    )
+    parser.add_argument(
+        "-t", "--trace", default=False, help=argparse.SUPPRESS, action="store_true"
     )
     parser.add_argument(
         "-v",
@@ -1094,7 +1313,18 @@ def main():
     parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"  # pylint: disable=W0212
     # Get our cli args
     args = parser.parse_args()
+
+    global CACHE
+    CACHE = Cache(args.verbose, os.path.join(args.preserved_files_path, '/cache'), cleanup_filelists=args.preserve_filelists, cleanup_db=args.preserve_db, existing_path=args.db_path, debug=args.debug)
+
+    global DB_TX_SIZE
+    DB_TX_SIZE = args.db_tx_size
+
     initLogger(args.verbose)
+
+    global PROFILER
+    PROFILER = Profiler(args.trace)
+
     LOGGER.info("Starting sorted batch transfer from HPSS (%s) to destination (%s)", args.source, args.destination)
     # Create our migration job
     job = MigrateJob(args)
@@ -1104,7 +1334,7 @@ def main():
 
     # Populate the db with HPSS data
     if args.db_path is None:
-        LOGGER.info("Getting file data from HPSS...")
+        LOGGER.info("Indexing candidate files for transfer from HPSS...")
         job.getSrcFiles()
 
     # Check for files that exist in the destination
@@ -1152,6 +1382,8 @@ def main():
         with open(reportfilename, "w", encoding="UTF-8") as f:
             json.dump(finalreport, f, indent=2)
         LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
+
+    PROFILER.print_report()
 
 
 if __name__ == "__main__":
