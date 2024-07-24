@@ -7,6 +7,9 @@ import json
 import logging
 import os
 import re
+import signal
+import tarfile
+import shutil
 import sqlalchemy
 import sys
 import threading
@@ -184,39 +187,84 @@ class Files(Base):
 #     *  Remove these comments and reformat code
 #       
 class Cache:
-    def __init__(self, verbose, output_path, cleanup_filelists=False, cleanup_db=False, existing_path=None, debug=False):
+    def __init__(self, verbose, cache_parent_path, cleanup_filelists=False, cleanup_db=False, existing_path=None, debug=False):
         self.verbose = verbose 
-        self.output_path = output_path
+        # Will either be --preserved-files-path or os.getcwd()
+        self.cache_parent_path = cache_parent_path
         self.cleanup_filelists = cleanup_filelists
         self.cleanup_db = cleanup_db
         self.existing_path = existing_path
         self.debug = debug
+        self.original_archive = None
 
         self.filelists = []
+
         if self.existing_path is None:
             self.archive_path = os.path.join(
-                self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.cache"
+                self.cache_parent_path, f"hpss_transfer_sorted_files_{int(time.time())}.cache"
             )
-            self.dbpath = os.path.join(self.archive_path, "database.db")
-            self.filelists_root_path = os.path.join(self.archive_path, "filelists")
+            self.cache_path = os.path.join(
+                self.archive_path, "cache"
+            )
+            self.dbpath = os.path.join(self.cache_path, "database.db")
+            self.filelists_root_path = os.path.join(self.cache_path, "filelists")
         else:
             self.archive_path = self.existing_path
             self.unpack()
             self.dbpath = os.path.join(
-                self.existing_path, "database.db"
+                self.existing_path, "cache", "database.db"
             )
-            self.filelists_root_path = os.path.join(self.archive_path, "filelists")
+            self.filelists_root_path = os.path.join(self.archive_path, "cache", "filelists")
 
+        # If the directory that the cache will be written to doesn't exist, go ahead and mkdir it
+        if not os.path.exists(self.cache_parent_path):
+            os.makedirs(self.cache_parent_path)
+
+        # If the archive_path doesn't exist, go ahead and mkdir it
+        if not os.path.exists(self.archive_path):
+            os.makedirs(self.archive_path)  # hpss_...cache
+            os.makedirs(self.cache_path) # hpss_..._.cache/cache
+            os.makedirs(self.filelists_root_path) # hpss_...cache/cache/filelists
+
+    def cleanup(self):
+        if self.cleanup_filelists and self.cleanup_db:
+            shutil.rmtree(self.archive_path)
+            return
+        elif self.cleanup_filelists and not self.cleanup_db:
+            shutil.rmtree(self.filelists_root_path)
+        elif self.cleanup_db and not self.cleanup_filelists:
+            os.remove(self.dbpath)
+            shutil.move(self.filelists_root_path, self.cache_parent_path)
+        self.pack()
+
+    def caught_exception(self, e):
+        self.cleanup_filelists = False
+        self.cleanup_db = False
+        # We call cleanup() here just in case we get a weird exception, we catch that exception and leave the cache in a state
+        # that the user expects
+        self.cleanup()
 
     def get_db_path(self):
         return self.dbpath
 
-    def archive(self):
-        # TODO: tar self.archive_path and place into output_path
-        pass
+    def pack(self):
+        # TODO: tar self.archive_path and place into cache_parent_path
+        with tarfile.open(f"{self.archive_path}.tar.gz", "w:gz") as t:
+            t.add(self.archive_path, arcname=os.path.basename(self.archive_path))
+        #shutil.rmtree(self.archive_path)
+        LOGGER.debug(f"Compressed cache into {self.archive_path}.tar.gz")
 
     def unpack(self):
-        # TODO: Untar self.archive_path into output_path
+        # TODO: Untar self.archive_path into cache_parent_path
+        #       (maybe use a tmpdir and reset the db path (will require fixing the line at 207)
+        #       There could be collision issues with name of the existing_path and the unpacked cache
+        #       Trying to add a 'cache' dir as the root of the cache. dest: cache_parent_path/cache/{filelists,database.db}
+        # TODO: Change this so that it unpacks the archivename.tar.gz into archivename/ 
+        self.original_archive = self.archive_path
+        self.archive_path = self.archive_path.split(".")[:-2]
+        os.makedirs(self.archive_path)
+        with tarfile.open(self.orignal_archive) as t:
+            t.extractall(self.archive_path)
         pass
 
     def get_unpacked_db_path(self):
@@ -225,32 +273,38 @@ class Cache:
     def get_unpacked_filelist_root_path(self):
         return self.filelists_root_path
 
+    def get_cache_path(self):
+        return self.cache_path
+
     def get_unpacked_archive_path(self):
         return self.archive_path
+
+    def get_unpacked_report_dir(self):
+        return self.cache_parent_path
 
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
 class Database:
-    def __init__(self, cleanup, verbose, output_path, disable_checksums, path=None, debug=False):
+    #def __init__(self, cleanup, verbose, output_path, disable_checksums, path=None, debug=False):
+    def __init__(self, verbose, disable_checksums, debug=False):
         self.disable_checksums = disable_checksums
         self.verbose = verbose
-        self.output_path = output_path
-        self.preservedb = cleanup
+        #self.output_path = output_path
+        #self.preservedb = cleanup
         self.vvs = {}
         self.desttrees = {}
         self.debug = debug
 
-        if path is None:
-            self.unmanaged_db = False
-            self.dbpath = os.path.join(
-                self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
-            )
-            CACHE.add_db(self.dbpath)
-        else:
-            self.unmanaged_db = True
-            self.dbpath = path
-            CACHE.add_db(self.dbpath, packed=True)
+        self.dbpath = CACHE.get_unpacked_db_path()
+        #if path is None:
+        #    self.unmanaged_db = False
+        #    self.dbpath = os.path.join(
+        #        self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
+        #    )
+        #else:
+        #    self.unmanaged_db = True
+        #    self.dbpath = path
 
         #Connect to DB
         try:
@@ -269,12 +323,12 @@ class Database:
         #self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
-    def __del__(self):
-        if self.preservedb:
-            LOGGER.info("DB saved at %s", self.dbpath)
-        else:
-            if not self.unmanaged_db:
-                os.remove(self.dbpath)
+    #def __del__(self):
+    #    if self.preservedb:
+    #        LOGGER.info("DB saved at %s", self.dbpath)
+    #    else:
+    #        if not self.unmanaged_db:
+    #            os.remove(self.dbpath)
 
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
@@ -679,10 +733,11 @@ class MigrateJob:
         self.destination = os.path.abspath(os.path.normpath(args.destination))
         self.dry_run = args.dry_run
         self.verbose = args.verbose
-        self.output_path = os.path.normpath(args.preserved_files_path)
+        #self.output_path = os.path.normpath(args.preserved_files_path)
+        self.filelists_path = CACHE.get_unpacked_filelist_root_path()
 
-        self.preserve_file_lists = args.preserve_file_lists
-        self.preserve_db = args.preserve_db
+        #self.preserve_file_lists = args.preserve_file_lists
+        #self.preserve_db = args.preserve_db
         self.disable_checksums = args.disable_checksums
         self.vvs_per_job = args.vvs_per_job
         self.addl_flags = args.additional_hsi_flags
@@ -692,12 +747,14 @@ class MigrateJob:
         self.hsi = "/sw/sources/hpss/bin/hsi"
 
         # If --db-path is defined, do not create a new db, use the one at the path provided
-        if args.db_path is not None:
-            self.db = Database(
-                self.preserve_db, self.verbose, self.output_path, self.disable_checksums, path=args.db_path, debug=args.debug
-            )
-        else:
-            self.db = Database(self.preserve_db, self.verbose, self.output_path, self.disable_checksums, debug=args.debug)
+        #if args.cache_path is not None:
+        #    self.db = Database(
+        #            #self.preserve_db, self.verbose, self.output_path, self.disable_checksums, path=args.db_path, debug=args.debug
+        #        self.verbose, self.disable_checksums, debug=args.debug
+        #    )
+        #else:
+        #    #self.db = Database(self.preserve_db, self.verbose, self.output_path, self.disable_checksums, debug=args.debug)
+        self.db = Database(self.verbose, self.disable_checksums, debug=args.debug)
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -738,7 +795,8 @@ class MigrateJob:
 
     def runHashList(self, files):
         infilename = os.path.join(
-            self.output_path, f"hpss_transfer_sorted_files.hashlist.list"
+            self.filelists_path, f"hpss_transfer_sorted_files.hashlist.list"
+            #self.output_path, f"hpss_transfer_sorted_files.hashlist.list"
         )
         # Write the infile to be passed into HSI
         with open(infilename, "w", encoding="UTF-8") as infile:
@@ -824,13 +882,16 @@ class MigrateJob:
             for vv in vvlist:
                 filelistnum += 1
                 tmpgetfilename = os.path.join(
-                    self.output_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
+                    self.filelists_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
+                    #self.output_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
                 )
                 tmphashfilename = os.path.join(
-                    self.output_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
+                    self.filelists_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
+                    #self.output_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
                 )
                 infilename = os.path.join(
-                    self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
+                    self.filelists_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
+                    #self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
                 with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
                     for chunk in self.db.getfilesbyvv(vv[0]):
@@ -942,8 +1003,8 @@ class MigrateJob:
                     LOGGER.info("Would have run: %s", migration_job.getcommand())
 
                 # Remove infile list if we're not worried about preserving
-                if not self.preserve_file_lists:
-                    os.remove(infilename)
+                #if not self.preserve_file_lists:
+                #    os.remove(infilename)
         return 0
 
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
@@ -1007,7 +1068,13 @@ class MigrateJob:
             report["existing_files_skipped"].append(
                 {"source": f[0], "destination": f[1]}
             )
-
+        if self.dry_run:
+            files = self.db.dumpfiles()
+            report["would_have_transferred"] = []
+            for f in files:
+                report["would_have_transferred"].append(
+                    {"source": f.path, "destination": f.dest}
+                )
         return report
 
     @property
@@ -1020,6 +1087,7 @@ class MigrateJob:
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
         for chunk in self.ls_job.run(): 
+            LOGGER.debug("Got chunk from hsi")
             files = []
             dirs = set()
 
@@ -1103,6 +1171,9 @@ class HSIJob:
             cmd.extend(self.flags.split(" "))
         cmd.extend(self.cmd.split(" "))
 
+        #TODO: Change self.verbose to self.dry_run 
+        LOGGER.debug(f"Running: {' '.join(cmd)}")
+
         output = []
         p = Popen(
             cmd,
@@ -1174,6 +1245,7 @@ def initLogger(verbose):
 
         ch.setFormatter(CustomFormatter())
         LOGGER.addHandler(ch)
+        LOGGER.debug("Set logger to debug because --verbose")
 
         #logging.basicConfig(
         #    level=logging.DEBUG, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
@@ -1239,22 +1311,22 @@ def main():
         help="Generate the file lists but do not actually checksum or transfer files, and output the `hsi` commands that would have been used",
     )
     parser.add_argument(
-        "-d",
-        "--db-path",
+        "-C",
+        "--cache-path",
         default=None,
         type=str,
-        help="Path to existing db generated by --preserve-db, or from an interrupted job. Picks up where the last job left off",
+        help="Path to existing cache generated by --preserve-cache, or from an interrupted job. Picks up where the last job left off",
     )
     parser.add_argument(
         "-l",
         "--preserve-file-lists",
         action="store_true",
         default=False,
-        help="Do not delete the file list generated by this script. Will write the list to the cwd",
+        help="Do not delete the file list generated by this script. Will write the list to the cwd or the value of --preserved-files-path",
     )
     parser.add_argument(
         "-p",
-        "--preserve-db",
+        "--preserve-cache",
         action="store_true",
         default=False,
         help="Do not delete the db cache. This can be useful for restarting an interrupted migration",
@@ -1314,13 +1386,21 @@ def main():
     # Get our cli args
     args = parser.parse_args()
 
+    initLogger(args.verbose)
+
     global CACHE
-    CACHE = Cache(args.verbose, os.path.join(args.preserved_files_path, '/cache'), cleanup_filelists=args.preserve_filelists, cleanup_db=args.preserve_db, existing_path=args.db_path, debug=args.debug)
+    cleanup_db = True
+    cleanup_filelists = not args.preserve_file_lists # The logic here is inverse so we ! the flags value
+    if args.preserve_cache:
+        cleanup_db = False
+        cleanup_filelists = False
+
+    LOGGER.debug(f"Creating cache: preserved_files_path={args.preserved_files_path} cleanup_filelists={cleanup_filelists} cleanup_db={cleanup_db} existing_path={args.cache_path} debug={args.debug}")
+    CACHE = Cache(args.verbose, args.preserved_files_path, cleanup_filelists=cleanup_filelists, cleanup_db=cleanup_db, existing_path=args.cache_path, debug=args.debug)
 
     global DB_TX_SIZE
     DB_TX_SIZE = args.db_tx_size
 
-    initLogger(args.verbose)
 
     global PROFILER
     PROFILER = Profiler(args.trace)
@@ -1329,11 +1409,11 @@ def main():
     # Create our migration job
     job = MigrateJob(args)
 
-    if args.db_path is not None:
+    if args.cache_path is not None:
         LOGGER.info("Resuming interrupted transfer.")
 
     # Populate the db with HPSS data
-    if args.db_path is None:
+    if args.cache_path is None:
         LOGGER.info("Indexing candidate files for transfer from HPSS...")
         job.getSrcFiles()
 
@@ -1378,13 +1458,26 @@ def main():
         reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
             int(time.time())
         )
-        reportfilename = os.path.join(args.preserved_files_path, reportfilename)
+        #reportfilename = os.path.join(args.preserved_files_path, reportfilename)
+        reportfilename = os.path.join(CACHE.get_unpacked_report_path(), reportfilename)
         with open(reportfilename, "w", encoding="UTF-8") as f:
             json.dump(finalreport, f, indent=2)
         LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
 
     PROFILER.print_report()
+    CACHE.cleanup()
 
+def __handle_sigs(signum, frame):
+    LOGGER.error(f"Caught signal: {signum}")
+    if CACHE is not None:
+        CACHE.caught_exception(signum)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    signal.signal(signal.SIGTERM, __handle_sigs)
+    signal.signal(signal.SIGINT, __handle_sigs)
+    try:
+        sys.exit(main())
+    except Exception as e:
+        LOGGER.error(f"Caught exception: {e}")
+        if CACHE is not None:
+            CACHE.caught_exception(e)
