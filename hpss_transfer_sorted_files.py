@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import traceback
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ LOGGER = None
 PROFILER = None
 DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
 CACHE = None
+DATABASE = None
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -166,26 +168,6 @@ class Files(Base):
 #
 # Meta-class to track database and filelists created and to package them into an archive in case of interruption
 #
-# TODO: 
-#     *  Change all Database and MigrationJob, etc to grab paths for db or filelist_root_path from the global CACHE
-#     *  Implement pack and unpack
-#     *  Add a Cache.pack() for when ANYTHING interrupts it. Like a global try, catch or something. Esp ctrl+c
-#     *  Implement state table to track if indexing, checksumming, etc has finished. This is to protect against 
-#           Interruption of indexing or checksumming operations
-#     *  Implement updating the state table
-#     *  Users should never care about the cache contents; just where the cache *is* or where the cache *wll be*
-#     *  Rename flags, etc to remove references to 'db' and replace with 'cache'
-#     *  Cache packing should be the LAST thing to happen ANYWHERE ANYTIME
-#     *  Also, do not pack the output report in the cache. Just place this in the output_path (--preserved-files-path?)
-#     *  Report output path should also be gotten from the CACHE object. Basically, this object will track all output files
-#           that are not part of the actual user data from HPSS
-#     *  Maybe use the state table to cache what flags it was run with? That way a user can restart a transfer with something like:
-#           ./script.py --cache-path path/to.cache --last-args
-#     *  Maybe have a new entry for each attempt of the run in the state table. Last state is always the row with the highest id
-#     *  Allows generation of a report to show each attempt and what the last state was
-#     *  ^^^^ This may be too much. Not sure we care enough to do this....
-#     *  Remove these comments and reformat code
-#       
 class Cache:
     def __init__(self, verbose, cache_parent_path, cleanup_filelists=False, cleanup_db=False, existing_path=None, debug=False):
         self.verbose = verbose 
@@ -211,16 +193,19 @@ class Cache:
         else:
             self.archive_path = self.existing_path
             self.unpack()
-            self.dbpath = os.path.join(
-                self.existing_path, "cache", "database.db"
+            self.cache_path = os.path.join(
+                    self.archive_path, "cache"
             )
-            self.filelists_root_path = os.path.join(self.archive_path, "cache", "filelists")
+            self.dbpath = os.path.join(
+                self.cache_path, "database.db"
+            )
+            self.filelists_root_path = os.path.join(self.cache_path, "filelists")
 
         # If the directory that the cache will be written to doesn't exist, go ahead and mkdir it
         if not os.path.exists(self.cache_parent_path):
             os.makedirs(self.cache_parent_path)
 
-        # If the archive_path doesn't exist, go ahead and mkdir it
+        # If the cache_path doesn't exist, go ahead and mkdir it
         if not os.path.exists(self.archive_path):
             os.makedirs(self.archive_path)  # hpss_...cache
             os.makedirs(self.cache_path) # hpss_..._.cache/cache
@@ -248,24 +233,37 @@ class Cache:
         return self.dbpath
 
     def pack(self):
-        # TODO: tar self.archive_path and place into cache_parent_path
+        # TODO: tar self.cache_path and place into cache_parent_path
         with tarfile.open(f"{self.archive_path}.tar.gz", "w:gz") as t:
             t.add(self.archive_path, arcname=os.path.basename(self.archive_path))
-        #shutil.rmtree(self.archive_path)
+        try:
+            shutil.rmtree(self.archive_path)
+        except:
+            time.sleep(5)
+            try:
+                shutil.rmtree(self.archive_path)
+            except e as Exception:
+                LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
+
         LOGGER.debug(f"Compressed cache into {self.archive_path}.tar.gz")
 
     def unpack(self):
-        # TODO: Untar self.archive_path into cache_parent_path
+        # TODO: Untar self.cache_path into cache_parent_path
         #       (maybe use a tmpdir and reset the db path (will require fixing the line at 207)
         #       There could be collision issues with name of the existing_path and the unpacked cache
         #       Trying to add a 'cache' dir as the root of the cache. dest: cache_parent_path/cache/{filelists,database.db}
         # TODO: Change this so that it unpacks the archivename.tar.gz into archivename/ 
-        self.original_archive = self.archive_path
-        self.archive_path = self.archive_path.split(".")[:-2]
-        os.makedirs(self.archive_path)
-        with tarfile.open(self.orignal_archive) as t:
-            t.extractall(self.archive_path)
-        pass
+        self.original_archive = self.archive_path # Save the path to the input archive. TODO: Use this in self.pack as destination?
+        self.archive_path = os.path.abspath(self.archive_path) # Gets the fully qualified path to the tar'd archive
+        # Save original path
+        cache_basename = '.'.join(list(filter(None,os.path.basename(self.archive_path).split(".")[:-2])))
+        # Interpolate the name of the cache
+        self.archive_path = os.path.join(self.cache_parent_path, cache_basename)
+        LOGGER.debug(f"Unpacking cache archive: archive_path: {self.archive_path}, cache_parent_path: {self.cache_parent_path}, existing_archive: {self.original_archive}")
+        # Untar the cache in the --preserved-files-path or cwd
+        with tarfile.open(self.original_archive) as t:
+            # If theres permissions issues, maybe set filter to either 'tar' or 'fully_trusted'
+            t.extractall(self.cache_parent_path, filter='data')
 
     def get_unpacked_db_path(self):
         return self.dbpath
@@ -276,8 +274,8 @@ class Cache:
     def get_cache_path(self):
         return self.cache_path
 
-    def get_unpacked_archive_path(self):
-        return self.archive_path
+    def get_unpacked_cache_path(self):
+        return self.cache_path
 
     def get_unpacked_report_dir(self):
         return self.cache_parent_path
@@ -321,6 +319,12 @@ class Database:
         self.files_tbl = sqlalchemy.Table('files', metadata, autoload_with=self.engine)
         self.desttree_tbl = sqlalchemy.Table('desttree', metadata, autoload_with=self.engine)
         #self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
+
+    def cleanup(self):
+        self.engine.dispose()
+
+    def __del__(self):
+        self.engine.dispose()
 
     # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
     #def __del__(self):
@@ -754,7 +758,8 @@ class MigrateJob:
         #    )
         #else:
         #    #self.db = Database(self.preserve_db, self.verbose, self.output_path, self.disable_checksums, debug=args.debug)
-        self.db = Database(self.verbose, self.disable_checksums, debug=args.debug)
+        global DATABASE
+        DATABASE = Database(self.verbose, self.disable_checksums, debug=args.debug)
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -768,30 +773,30 @@ class MigrateJob:
     # Check the destination filesystem for files that match names at the predicted destination directory
     def checkForExisting(self):
         if not self.overwrite:
-            files = self.db.dumpfiles()
+            files = DATABASE.dumpfiles()
 
             for file in files:
                 destpath = file[10]
                 fileid = file[0]
                 if os.path.isfile(destpath):
-                    self.db.markexists(fileid)
+                    DATABASE.markexists(fileid)
 
     # Create the destination directory structure
     def createDestTree(self):
-        destpaths = self.db.dumpdesttree()
+        destpaths = DATABASE.dumpdesttree()
         for path in destpaths:
             try:
                 os.makedirs(path.path, exist_ok=True)
             except FileExistsError:
                 LOGGER.debug("Skipping mkdir of %s; directory already exists", path.path)
-                self.db.markdestcreated(path.id)
+                DATABASE.markdestcreated(path.id)
             except Exception as e:  # pylint: disable=bare-except
                 LOGGER.critical(
                     "ERROR: Could not create destination directory (%s).\n(%s)", path.path, e
                 )
                 sys.exit(3)
             else:
-                self.db.markdestcreated(path.id)
+                DATABASE.markdestcreated(path.id)
 
     def runHashList(self, files):
         infilename = os.path.join(
@@ -824,8 +829,8 @@ class MigrateJob:
 
     def writeExistingHashes(self, hashlistout):
         for path in hashlistout:
-            self.db.setsrcchecksum(path, hashlistout[path])
-            self.db.markfileashpsschecksumcomplete(path)
+            DATABASE.setsrcchecksum(path, hashlistout[path])
+            DATABASE.markfileashpsschecksumcomplete(path)
 
     # This is the main migration thread! All the fun stuff happens here
     # - Generates the file lists
@@ -846,11 +851,11 @@ class MigrateJob:
                 yield lst[i : i + chunksize]
 
         # Get chunked list of vvs
-        allvvs = self.db.getvvswithnoncompletefiles()
+        allvvs = DATABASE.getvvswithnoncompletefiles()
         vvs = list(chunk(allvvs, int(self.vvs_per_job)))
 
         # Get list of exisitng files from the db
-        existingFiles = self.db.getexistingfiles()
+        existingFiles = DATABASE.getexistingfiles()
 
         if self.overwrite:
             existingFiles = []
@@ -870,7 +875,7 @@ class MigrateJob:
         # Set some variables for status output (esp if not using the progress bar)
         filelistnum = 0
         filesCompleted = len(existingFiles)
-        filesTotal = self.db.gettotalnumberoffiles()[0]
+        filesTotal = DATABASE.gettotalnumberoffiles()[0]
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
@@ -894,7 +899,7 @@ class MigrateJob:
                     #self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
                 with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
-                    for chunk in self.db.getfilesbyvv(vv[0]):
+                    for chunk in DATABASE.getfilesbyvv(vv[0]):
                         LOGGER.debug("Writing chunk of %s to temporary file list...", DB_TX_SIZE)
                         files = chunk
                         files = [f for f in files if f not in existingFiles]
@@ -965,7 +970,7 @@ class MigrateJob:
                 )
                 if not self.dry_run:
                     for f in files:
-                        self.db.markfileasstaging(f[2])
+                        DATABASE.markfileasstaging(f[2])
                     # Run the job!
                     # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                     last_notif_time = int(time.time())
@@ -981,22 +986,22 @@ class MigrateJob:
                                 )
                             if "(md5)" in line:
                                 checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
-                                self.db.setsrcchecksum(srcpath, checksum)
-                                self.db.markfileashpsschecksumcomplete(srcpath)
+                                DATABASE.setsrcchecksum(srcpath, checksum)
+                                DATABASE.markfileashpsschecksumcomplete(srcpath)
 
                             matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
                             if matches:
                                 srcpath = matches.group(2)
                                 filesCompleted += 1
                                 LOGGER.debug("Processed file (%s/%s): %s", filesCompleted, filesTotal, srcpath)
-                                self.db.markfileastransfercompleted(srcpath)
+                                DATABASE.markfileastransfercompleted(srcpath)
 
                             if "get: Error" in line:
                                 LOGGER.error(
                                     "File %s failed to transfer from HPSS",
                                     line.split(" ")[-1],
                                 )
-                                self.db.markasfailed(line.split(" ")[-1])
+                                DATABASE.markasfailed(line.split(" ")[-1])
                     PROFILER.snapshot()
                     # Update our stats
                 else:
@@ -1010,21 +1015,21 @@ class MigrateJob:
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
     # We're defaulting to a 4 thread pool for checksumming. This can be overwritten by --checksum-threads
     def startDestChecksumming(self):
-        files = self.db.getnonfailedsrcchecksumfiles()
+        files = DATABASE.getnonfailedsrcchecksumfiles()
         values = []
         with Pool(self.checksum_threads) as p:
             values = p.map(doDestChecksum, files)
 
         for value in values:
             if value["returncode"] != 0:
-                self.db.markfilechecksumasfailed(value["id"])
+                DATABASE.markfilechecksumasfailed(value["id"])
             else:
-                self.db.markfilechecksumascomplete(value["id"])
-            self.db.setdestchecksum(value["id"], value["checksum"])
+                DATABASE.markfilechecksumascomplete(value["id"])
+            DATABASE.setdestchecksum(value["id"], value["checksum"])
 
     # Generates a report of any non-matching checksums
     def checksumMismatchReport(self):
-        files = self.db.getnonmatchingchecksums()
+        files = DATABASE.getnonmatchingchecksums()
         ret = {}
         ret["checksum_mismatch"] = []
         if len(files) > 0:
@@ -1046,34 +1051,34 @@ class MigrateJob:
     # Generates our overall report. This will get written out to a JSON file for users
     def genReport(self, mismatchreport):
         report = mismatchreport
-        failedtransfers = self.db.getfailedtransfers()
+        failedtransfers = DATABASE.getfailedtransfers()
         report["failed_transfers"] = []
         for f in failedtransfers:
             report["failed_transfers"].append({"source": f[0], "destination": f[1]})
-        failedchecksums = self.db.getfailedchecksums()
+        failedchecksums = DATABASE.getfailedchecksums()
         report["failed_to_checksum"] = []
         for f in failedchecksums:
             report["failed_to_checksum"].append(
                 {"source": (f[0], f[1]), "destination": (f[2], f[3])}
             )
-        succeededfiles = self.db.getsuccessfultransfers()
+        succeededfiles = DATABASE.getsuccessfultransfers()
         report["successful_transfers"] = []
         for f in succeededfiles:
             report["successful_transfers"].append(
                 {"source": f[0], "destination": f[1], "checksum": f[2]}
             )
-        existingfiles = self.db.getexistingfiles()
+        existingfiles = DATABASE.getexistingfiles()
         report["existing_files_skipped"] = []
         for f in existingfiles:
             report["existing_files_skipped"].append(
                 {"source": f[0], "destination": f[1]}
             )
         if self.dry_run:
-            files = self.db.dumpfiles()
+            files = DATABASE.dumpfiles()
             report["would_have_transferred"] = []
             for f in files:
                 report["would_have_transferred"].append(
-                    {"source": f.path, "destination": f.dest}
+                    {"source": f[0].path, "destination": f[0].dest}
                 )
         return report
 
@@ -1104,14 +1109,14 @@ class MigrateJob:
                 LOGGER.critical("No in HPSS files matched query: %s", self.source)
                 sys.exit(6)
             # Removing junk from array
-            dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in self.db.desttrees ]
+            dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in DATABASE.desttrees ]
             # Adding the root destination since files can be at depth 0, and we want to make sure its there
-            if self.destination not in self.db.desttrees:
+            if self.destination not in DATABASE.desttrees:
                 dirs.append(DestTree(created=False, path=self.destination))
             if len(dirs) > 0:
-                self.db.insertdesttree(dirs)
+                DATABASE.insertdesttree(dirs)
             if len(files) > 0:
-                self.db.insertfiles(files, self._hpss_root_dir, self.destination)
+                DATABASE.insertfiles(files, self._hpss_root_dir, self.destination)
         PROFILER.snapshot()
 
 
@@ -1454,21 +1459,24 @@ def main():
     LOGGER.debug(json.dumps(finalreport, indent=2))
 
     # Write the report to a file
-    if not args.dry_run:
-        reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
-            int(time.time())
-        )
-        #reportfilename = os.path.join(args.preserved_files_path, reportfilename)
-        reportfilename = os.path.join(CACHE.get_unpacked_report_path(), reportfilename)
-        with open(reportfilename, "w", encoding="UTF-8") as f:
-            json.dump(finalreport, f, indent=2)
-        LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
+    #if not args.dry_run:
+    reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
+        int(time.time())
+    )
+    #reportfilename = os.path.join(args.preserved_files_path, reportfilename)
+    reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
+    with open(reportfilename, "w", encoding="UTF-8") as f:
+        json.dump(finalreport, f, indent=2)
+    LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
 
     PROFILER.print_report()
+    DATABASE.cleanup()
     CACHE.cleanup()
 
 def __handle_sigs(signum, frame):
     LOGGER.error(f"Caught signal: {signum}")
+    if DATABASE is not None:
+        DATABASE.cleanup()
     if CACHE is not None:
         CACHE.caught_exception(signum)
 
@@ -1479,5 +1487,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         LOGGER.error(f"Caught exception: {e}")
+        LOGGER.debug(traceback.format_exc())
+        if DATABASE is not None:
+            DATABASE.cleanup()
         if CACHE is not None:
             CACHE.caught_exception(e)
+        sys.exit(99)
