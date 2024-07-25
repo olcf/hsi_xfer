@@ -41,6 +41,9 @@ PROFILER = None
 DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
 CACHE = None
 DATABASE = None
+SCHEMA_VERSION = 2
+DYING = False
+PIDS = []
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
 # set --vvs-per-job=-1
@@ -141,8 +144,6 @@ class State(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     schema_version: Mapped[int]
     indexing_complete: Mapped[bool]
-    filelists_complete: Mapped[bool]
-    filelist_name: Mapped[str]
     filelist_count: Mapped[int]
 
 
@@ -233,9 +234,12 @@ class Cache:
         return self.dbpath
 
     def pack(self):
-        # TODO: tar self.cache_path and place into cache_parent_path
+        LOGGER.info("Saving cache state...")
+        LOGGER.debug("Packing up cache files into tarball")
         with tarfile.open(f"{self.archive_path}.tar.gz", "w:gz") as t:
             t.add(self.archive_path, arcname=os.path.basename(self.archive_path))
+            time.sleep(1)
+
         try:
             shutil.rmtree(self.archive_path)
         except:
@@ -245,7 +249,7 @@ class Cache:
             except e as Exception:
                 LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
 
-        LOGGER.debug(f"Compressed cache into {self.archive_path}.tar.gz")
+        LOGGER.info(f"Saved cache at {self.archive_path}.tar.gz")
 
     def unpack(self):
         # TODO: Untar self.cache_path into cache_parent_path
@@ -284,25 +288,14 @@ class Cache:
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
 class Database:
-    #def __init__(self, cleanup, verbose, output_path, disable_checksums, path=None, debug=False):
     def __init__(self, verbose, disable_checksums, debug=False):
         self.disable_checksums = disable_checksums
         self.verbose = verbose
-        #self.output_path = output_path
-        #self.preservedb = cleanup
         self.vvs = {}
         self.desttrees = {}
         self.debug = debug
 
         self.dbpath = CACHE.get_unpacked_db_path()
-        #if path is None:
-        #    self.unmanaged_db = False
-        #    self.dbpath = os.path.join(
-        #        self.output_path, f"hpss_transfer_sorted_files_{int(time.time())}.db"
-        #    )
-        #else:
-        #    self.unmanaged_db = True
-        #    self.dbpath = path
 
         #Connect to DB
         try:
@@ -318,47 +311,85 @@ class Database:
         self.vvs_tbl = sqlalchemy.Table('vvs', metadata, autoload_with=self.engine)
         self.files_tbl = sqlalchemy.Table('files', metadata, autoload_with=self.engine)
         self.desttree_tbl = sqlalchemy.Table('desttree', metadata, autoload_with=self.engine)
-        #self.destination_tbl = sqlalchemy.Table('destination', metadata, autoload_with=self.engine)
+        self.state_tbl = sqlalchemy.Table('state', metadata, autoload_with=self.engine)
+        self.init_state_tbl()
 
     def cleanup(self):
+        LOGGER.debug("Killing DB connection")
         self.engine.dispose()
 
     def __del__(self):
         self.engine.dispose()
 
-    # Destructor. If we want to preserve the db, don't delete it. Otherwise blow it away
-    #def __del__(self):
-    #    if self.preservedb:
-    #        LOGGER.info("DB saved at %s", self.dbpath)
-    #    else:
-    #        if not self.unmanaged_db:
-    #            os.remove(self.dbpath)
+    def init_state_tbl(self):
+        schema_version = SCHEMA_VERSION
+        indexing_complete = False
+        filelist_count = 0
+        LOGGER.debug(f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}")
+        row = State(schema_version=schema_version, indexing_complete=indexing_complete, filelist_count=filelist_count)
+        with Session(bind=self.engine) as s:
+            cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()
+            if len(cur) > 0:
+                cur = cur[0][0]
+                LOGGER.debug(f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}")
+                if cur.schema_version != schema_version:
+                    LOGGER.error(f"Attempting to use a cache from an old version of this tool. This will probably fail!")
+            s.add(row)
+            s.flush()
+            s.commit()
+
+
+    def get_state(self):
+        cur = None
+        with Session(bind=self.engine) as s:
+            cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()[0][0]
+        return cur
+
+
+    def update_state(self, schema_version=SCHEMA_VERSION, indexing_complete=False, filelist_count=0):
+        LOGGER.debug(f"Updating state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}")
+        with Session(bind=self.engine) as s:
+            try:
+                cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()[0][0]
+                if indexing_complete:
+                    cur.indexing_complete = indexing_complete
+                if filelist_count > 0:
+                    cur.filelist_count = filelist_count
+                s.execute(update(State).where(State.id == cur.id).values(schema_version=cur.schema_version, indexing_complete=cur.indexing_complete, filelist_count=cur.filelist_count))
+                s.flush()
+                s.commit()
+            except Exception as e:
+                if not DYING:
+                    LOGGER.error("Could not update state information in the cache!")
+                    sys.exit(999)
+                else:
+                    LOGGER.debug("Encountered the following exception while dying:")
+                    LOGGER.debug(f"{e}")
+
 
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
         LOGGER.debug(f"Batch inserting destination tree into 'desttree' table (num_dirs={len(tree)})...")
-        try:
-            if len(tree) > 0:
-                with Session(bind=self.engine) as s:
+        if len(tree) > 0:
+            with Session(bind=self.engine) as s:
+                try:
                     s.add_all(tree)
-                    #s.execute(
-                    #        insert(DestTree).values(tree)
-                    #)
                     s.flush()
                     for t in tree:
                         self.desttrees[t.path] = t.id
                     s.commit()
-        except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath} (insertdesttree)")
-            LOGGER.debug(f"{e}")
-            sys.exit(111)
+                except Exception as e:
+                    if not DYING:
+                        LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath} DYING={DYING}")
+                        LOGGER.debug("(insertdesttree)")
+                        LOGGER.debug(f"{e}")
+                        sys.exit(111)
     
 
     # Insert file entries into the files table
     def insertfiles(self, files, srcroot, destroot):
         LOGGER.debug(f"Batch inserting files into 'files' table (num_files={len(files)})...")
 
-        #TODO: may need to chunk 'files' up
         files_to_insert = []
         destination_to_insert = []
         for file in files[:]:
@@ -370,7 +401,6 @@ class Database:
                 continue
             vvid = self.vvExists(vv) 
             dest = fpath.replace(srcroot, destroot)
-            #if not self.fileExists(fpath): # This does a select for each file
             if vvid is None:
                 self.insertvv(vv)
                 vvid = self.vvExists(vv) 
@@ -388,18 +418,17 @@ class Database:
             files.remove(file)
 
         # Perform the actual inserts
-        try:
             with Session(bind=self.engine) as s:
-                s.add_all(files_to_insert)
-                s.flush()
-                #s.insert(Destination).values(destination_to_insert)
-                #s.add_all([ Destination(path=f.path, completed=False, srcfile=f.id) for f in files_to_insert ])
-                s.flush()
-                s.commit()
-        except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
-            LOGGER.debug(f"{e}")
-            sys.exit(111)
+                try:
+                    s.add_all(files_to_insert)
+                    s.flush()
+                    s.commit()
+                except Exception as e:
+                    if not DYING:
+                        LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}")
+                        LOGGER.debug("(insertfiles)")
+                        LOGGER.debug(f"{e}")
+                        sys.exit(111)
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
@@ -407,7 +436,6 @@ class Database:
 
         rows = []
         with Session(self.engine) as s:
-            #"SELECT path,dest,id FROM files WHERE transfer_status=? AND checksum_status <> ?",
             rows = s.execute(stmt).fetchall()
 
         return rows
@@ -417,7 +445,6 @@ class Database:
         stmt = select(Files.path, Files.dest).select_from(Files).where(Files.transfer_status == TransferStatus.failed.value)
         rows = []
         with Session(self.engine) as s:
-            #"SELECT path,dest FROM files WHERE transfer_status=?",
             rows = s.execute(stmt).fetchall()
         return rows
 
@@ -426,7 +453,6 @@ class Database:
         stmt = select(Files.path, Files.src_checksum, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.failed.value)
         rows = []
         with Session(self.engine) as s:
-            #"SELECT path,src_checksum,dest,dest_checksum FROM files WHERE checksum_status=?",
             rows = s.execute(stmt).fetchall()
         return rows
 
@@ -435,7 +461,6 @@ class Database:
         stmt = select(Files.path, Files.dest, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.completed.value).where(Files.transfer_status == TransferStatus.completed.value)
         rows = []
         with Session(self.engine) as s:
-            #"SELECT path,dest,dest_checksum FROM files WHERE checksum_status=? AND transfer_status=?",
             rows = s.execute(stmt).fetchall()
         return rows
 
@@ -444,7 +469,6 @@ class Database:
         stmt = update(Files).where(Files.path == srcpath).values(transfer_status=TransferStatus.failed.value)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET transfer_status=? WHERE path = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -457,7 +481,6 @@ class Database:
         stmt = update(DestTree).values(created=True).where(DestTree.id == destid)
         try:
             with Session(self.engine) as s:
-                #"UPDATE desttree SET created=1 WHERE id = ?"
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -471,7 +494,6 @@ class Database:
         stmt = update(Files).values(transfer_status=TransferStatus.staging.value).where(Files.id == fileid)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET transfer_status=? WHERE id = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -484,7 +506,6 @@ class Database:
         stmt = update(Files).values(src_checksum=checksum).where(Files.path == srcpath)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET src_checksum=? WHERE path = ?"
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -497,7 +518,6 @@ class Database:
         stmt = update(Files).values(dest_checksum=checksum).where(Files.id == fileid)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET dest_checksum=? WHERE id = ?", [checksum, fileid]
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -510,7 +530,6 @@ class Database:
         stmt = update(Files).values(checksum_status=ChecksumStatus.completed.value).where(Files.id == fileid)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET checksum_status=? WHERE id = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -523,7 +542,6 @@ class Database:
         stmt = update(Files).values(checksum_status=ChecksumStatus.failed.value).where(Files.id == fileid)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET checksum_status=? WHERE id = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -537,7 +555,6 @@ class Database:
         stmt = update(Files).values(transfer_status=TransferStatus.completed.value).where(Files.path == srcpath)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET checksum_status=? WHERE id = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -550,7 +567,6 @@ class Database:
         stmt = update(Files).values(checksum_status=ChecksumStatus.hpss_complete.value).where(Files.path == srcpath)
         try:
             with Session(self.engine) as s:
-                #"UPDATE files SET checksum_status=? WHERE path = ?",
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
@@ -564,16 +580,12 @@ class Database:
         if "X" in vv or "H" in vv:
             istape = True
         v = VV(name=vv, is_tape=istape)
-        #stmt = insert(VV).values(name=vv, is_tape=istape)
         try:
             with Session(self.engine) as s:
-                #s.execute(stmt)
                 s.add(v)
                 s.flush()
                 self.vvs[vv] = v.id
                 s.commit()
-                #row = s.execute(select(VV.id).select_from(VV).where(VV.name == vv)).fetchall()
-                #self.vvs[vv] = row[0]
 
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
@@ -606,10 +618,6 @@ class Database:
                         select(DestTree.id, DestTree.path).select_from(DestTree).where(DestTree.path == dirname)
                 ).first()
             return row if row is not None else []
-#        rows = self._get_rows(
-#            "SELECT id, path FROM desttree WHERE path LIKE ?", [dirname]
-#        )
-#        return rows[0]
 
     # Get file entries where the source and dest checksums do not match
     def getnonmatchingchecksums(self):
@@ -621,13 +629,7 @@ class Database:
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
-        #suffix = "OR (dest_checksum IS NULL AND src_checksum IS NULL AND destfileexists <> 1)"
-        #if self.disable_checksums:
-        #    suffix = ""
 
-        #rows = self._get_rows(
-        #    "SELECT path,src_checksum,dest,dest_checksum FROM files WHERE dest_checksum <> src_checksum {}".format(suffix) 
-        #)
         return rows
 
     # vvExists will return None if theres no entries, and the rowid if there is
@@ -636,12 +638,6 @@ class Database:
             return None
         else:
             return self.vvs[vv]
-
-        #row = self.getvv(vv)
-        #if row is not None:
-        #    if row[1] == vv:
-        #        return row[0]
-        #return None
 
     # fileExists will return None if theres no entries, and the rowid if there is
     def fileExists(self, file):
@@ -655,7 +651,14 @@ class Database:
     def gettotalnumberoffiles(self):
         row = None
         with Session(self.engine) as s:
-            row = s.execute(select(func.count('*')).select_from(Files)).one_or_none()
+            try:
+                row = s.execute(select(func.count('*')).select_from(Files)).one_or_none()
+            except Exception as e:
+                    LOGGER.debug("Encountered the following exception in gettotalnumberoffiles while dying")
+                    LOGGER.debug(f"{e}")
+                    if not DYING:
+                        LOGGER.critical("Could not read from database. Exiting. rc=112")
+                        sys.exit(112)
         return row if row is not None else []
 
     # Get files marked as 'destination file exists'
@@ -666,7 +669,6 @@ class Database:
                     select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.destfileexists==True)
             ).fetchall()
         return rows
-    #rows = self._get_rows("SELECT path,dest,id FROM files WHERE destfileexists=1")
 
     # get a file by source path
     def getfile(self, file):
@@ -676,7 +678,6 @@ class Database:
                     select(Files.id, Files.path).select_from(Files).where(Files.path == file)
             ).fetchall()
         return rows
-    #rows = self._get_rows("SELECT id, path FROM files WHERE path LIKE ?", [file])
 
     # Get a list of files by VV (DB) id
     def getfilesbyvv(self, vvid):
@@ -712,7 +713,6 @@ class Database:
     def dumpdesttree(self):
         rows = []
         with Session(self.engine) as s:
-            #rows = s.execute(select(DestTree).order_by(func.length(DestTree.path))).fetchall()
             rows = s.query(DestTree).filter(func.length(DestTree.path)).all()
         return rows
 
@@ -737,11 +737,8 @@ class MigrateJob:
         self.destination = os.path.abspath(os.path.normpath(args.destination))
         self.dry_run = args.dry_run
         self.verbose = args.verbose
-        #self.output_path = os.path.normpath(args.preserved_files_path)
         self.filelists_path = CACHE.get_unpacked_filelist_root_path()
 
-        #self.preserve_file_lists = args.preserve_file_lists
-        #self.preserve_db = args.preserve_db
         self.disable_checksums = args.disable_checksums
         self.vvs_per_job = args.vvs_per_job
         self.addl_flags = args.additional_hsi_flags
@@ -750,14 +747,6 @@ class MigrateJob:
         self.checksum_threads = args.checksum_threads
         self.hsi = "/sw/sources/hpss/bin/hsi"
 
-        # If --db-path is defined, do not create a new db, use the one at the path provided
-        #if args.cache_path is not None:
-        #    self.db = Database(
-        #            #self.preserve_db, self.verbose, self.output_path, self.disable_checksums, path=args.db_path, debug=args.debug
-        #        self.verbose, self.disable_checksums, debug=args.debug
-        #    )
-        #else:
-        #    #self.db = Database(self.preserve_db, self.verbose, self.output_path, self.disable_checksums, debug=args.debug)
         global DATABASE
         DATABASE = Database(self.verbose, self.disable_checksums, debug=args.debug)
 
@@ -774,12 +763,16 @@ class MigrateJob:
     def checkForExisting(self):
         if not self.overwrite:
             files = DATABASE.dumpfiles()
+            #LOGGER.debug(files)
 
             for file in files:
-                destpath = file[10]
-                fileid = file[0]
+                destpath = file[0].dest
+                fileid = file[0].id
+                LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}")
                 if os.path.isfile(destpath):
                     DATABASE.markexists(fileid)
+        else:
+            LOGGER.debug("Skipping check for existing files due to --overwrite-existing")
 
     # Create the destination directory structure
     def createDestTree(self):
@@ -801,7 +794,6 @@ class MigrateJob:
     def runHashList(self, files):
         infilename = os.path.join(
             self.filelists_path, f"hpss_transfer_sorted_files.hashlist.list"
-            #self.output_path, f"hpss_transfer_sorted_files.hashlist.list"
         )
         # Write the infile to be passed into HSI
         with open(infilename, "w", encoding="UTF-8") as infile:
@@ -881,6 +873,7 @@ class MigrateJob:
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
+        DATABASE.update_state(filelist_count=len(vvs))
         for vvlist in vvs:
             files = []
             # Unpack chunk. Will generally just be a list of 1 vvid, but in case --vvs-per-job is set, this will chunk it up
@@ -888,34 +881,31 @@ class MigrateJob:
                 filelistnum += 1
                 tmpgetfilename = os.path.join(
                     self.filelists_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
-                    #self.output_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
                 )
                 tmphashfilename = os.path.join(
                     self.filelists_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
-                    #self.output_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
                 )
                 infilename = os.path.join(
                     self.filelists_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
-                    #self.output_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
                 )
                 with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
                     for chunk in DATABASE.getfilesbyvv(vv[0]):
-                        LOGGER.debug("Writing chunk of %s to temporary file list...", DB_TX_SIZE)
                         files = chunk
                         files = [f for f in files if f not in existingFiles]
-
-                        # Do a hashlist to get files that have hashes already
-                        hashlistout = self.runHashList(files)
-                        # if file has hash; save to db
-                        self.writeExistingHashes(hashlistout)
-                        # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
-                        to_hash = [ f for f in files if f[0] not in hashlistout ]
-
 
                         #TODO: Ensure that this does not kill performance
                         # We're going to be writing multiple gets and hashcreate commands here
                         # Write each to a separate file, and append to infile at the end?
                         if len(files) > 0:
+                            LOGGER.debug("Writing chunk of %s to temporary file list...", len(chunk))
+
+                            # Do a hashlist to get files that have hashes already
+                            hashlistout = self.runHashList(files)
+                            # if file has hash; save to db
+                            self.writeExistingHashes(hashlistout)
+                            # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
+                            to_hash = [ f for f in files if f[0] not in hashlistout ]
+
                             getfile.write(
                                 "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
                             )
@@ -927,89 +917,87 @@ class MigrateJob:
                                 hashfile.write("\n".join(["{}".format(f[0]) for f in to_hash]))
                                 hashfile.write("\n")
 
-                # Get the length of the hashfiles
-                hashfilelen = 0
-                with open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
-                    hashfilelen = sum(1 for _ in hashfile)
+                if len(files) > 0:
+                    # Get the length of the hashfiles
+                    hashfilelen = 0
+                    with open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                        hashfilelen = sum(1 for _ in hashfile)
 
-                # Combine both the hashfile and getfile here
-                with open(infilename, "w", encoding="UTF-8") as infile, open(tmpgetfilename, "r", encoding="UTF-8") as getfile, open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
-                    LOGGER.debug("Combining temporary file lists")
-                    # Write the infile to be passed into HSI
-                    getcmd = "get -T on << EOF\n"
-                    if self.disable_ta:
-                        getcmd = "get -T off << EOF\n"
+                    # Combine both the hashfile and getfile here
+                    with open(infilename, "w", encoding="UTF-8") as infile, open(tmpgetfilename, "r", encoding="UTF-8") as getfile, open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                        LOGGER.debug("Combining temporary file lists")
+                        # Write the infile to be passed into HSI
+                        getcmd = "get -T on << EOF\n"
+                        if self.disable_ta:
+                            getcmd = "get -T off << EOF\n"
 
-                    # hashcreate can not use the TA, so we force -T off
-                    hashcreatecmd = "hashcreate -T off << EOF\n"
-                    infile.write(getcmd)
-                    for line in getfile:
-                        infile.write(line)
-                    infile.write("EOF\n")
-                    if not self.disable_checksums and hashfilelen > 0:
-                        infile.write(hashcreatecmd)
-                        for hashline in hashfile:
-                            infile.write(hashline)
-                        infile.write("EOF")
+                        # hashcreate can not use the TA, so we force -T off
+                        hashcreatecmd = "hashcreate -T off << EOF\n"
+                        infile.write(getcmd)
+                        for line in getfile:
+                            infile.write(line)
+                        infile.write("EOF\n")
+                        if not self.disable_checksums and hashfilelen > 0:
+                            infile.write(hashcreatecmd)
+                            for hashline in hashfile:
+                                infile.write(hashline)
+                            infile.write("EOF")
 
-                # Remove our tmp files
-                LOGGER.debug("Removing temporary file lists")
-                os.remove(tmphashfilename)
-                os.remove(tmpgetfilename)
+                    # Remove our tmp files
+                    LOGGER.debug("Removing temporary file lists")
+                    os.remove(tmphashfilename)
+                    os.remove(tmpgetfilename)
 
-                # This is our HSI job
-                migration_job = HSIJob(
-                    self.hsi,
-                    self.addl_flags,
-                    True,
-                    self.verbose,
-                    "in {}".format(infilename),
-                )
-                LOGGER.info(
-                    "Starting migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
-                )
-                if not self.dry_run:
-                    for f in files:
-                        DATABASE.markfileasstaging(f[2])
-                    # Run the job!
-                    # Scan through the output looking for errors and md5 sums. Populate the db accordingly
-                    last_notif_time = int(time.time())
-                    first_iter = True
-                    for chunk in migration_job.run(continueOnFailure=True):
-                        for line in chunk:
-                            if int(time.time()) - last_notif_time >= 30 or first_iter:
-                                first_iter = False
-                                LOGGER.info(
-                                    "%s/%s file transfers have been attempted",
-                                    filesCompleted,
-                                    filesTotal,
-                                )
-                            if "(md5)" in line:
-                                checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
-                                DATABASE.setsrcchecksum(srcpath, checksum)
-                                DATABASE.markfileashpsschecksumcomplete(srcpath)
+                    # This is our HSI job
+                    migration_job = HSIJob(
+                        self.hsi,
+                        self.addl_flags,
+                        True,
+                        self.verbose,
+                        "in {}".format(infilename),
+                    )
+                    LOGGER.info(
+                        "Starting migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
+                    )
+                    if not self.dry_run:
+                        for f in files:
+                            DATABASE.markfileasstaging(f[2])
+                        # Run the job!
+                        # Scan through the output looking for errors and md5 sums. Populate the db accordingly
+                        last_notif_time = int(time.time())
+                        first_iter = True
+                        for chunk in migration_job.run(continueOnFailure=True):
+                            for line in chunk:
+                                if int(time.time()) - last_notif_time >= 30 or first_iter:
+                                    first_iter = False
+                                    LOGGER.info(
+                                        "%s/%s file transfers have been attempted",
+                                        filesCompleted,
+                                        filesTotal,
+                                    )
+                                if "(md5)" in line:
+                                    checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
+                                    DATABASE.setsrcchecksum(srcpath, checksum)
+                                    DATABASE.markfileashpsschecksumcomplete(srcpath)
 
-                            matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
-                            if matches:
-                                srcpath = matches.group(2)
-                                filesCompleted += 1
-                                LOGGER.debug("Processed file (%s/%s): %s", filesCompleted, filesTotal, srcpath)
-                                DATABASE.markfileastransfercompleted(srcpath)
+                                matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
+                                if matches:
+                                    srcpath = matches.group(2)
+                                    filesCompleted += 1
+                                    LOGGER.debug("Processed file (%s/%s): %s", filesCompleted, filesTotal, srcpath)
+                                    DATABASE.markfileastransfercompleted(srcpath)
 
-                            if "get: Error" in line:
-                                LOGGER.error(
-                                    "File %s failed to transfer from HPSS",
-                                    line.split(" ")[-1],
-                                )
-                                DATABASE.markasfailed(line.split(" ")[-1])
-                    PROFILER.snapshot()
-                    # Update our stats
+                                if "get: Error" in line:
+                                    LOGGER.error(
+                                        "File %s failed to transfer from HPSS",
+                                        line.split(" ")[-1],
+                                    )
+                                    DATABASE.markasfailed(line.split(" ")[-1])
+                        PROFILER.snapshot()
+                    else:
+                        LOGGER.info("Would have run: %s", migration_job.getcommand())
                 else:
-                    LOGGER.info("Would have run: %s", migration_job.getcommand())
-
-                # Remove infile list if we're not worried about preserving
-                #if not self.preserve_file_lists:
-                #    os.remove(infilename)
+                    LOGGER.debug("Skipping file list due to existing files. Use --overwrite-existing to bypass this")
         return 0
 
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
@@ -1091,32 +1079,37 @@ class MigrateJob:
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
-        for chunk in self.ls_job.run(): 
-            LOGGER.debug("Got chunk from hsi")
-            files = []
-            dirs = set()
+        if not DATABASE.get_state().indexing_complete:
+            for chunk in self.ls_job.run(): 
+                LOGGER.debug("Got chunk from hsi")
+                files = []
+                dirs = set()
 
-            for line in chunk:
-                s = line.split("\t")
-                objtype = s[0]
-                # If this is a file entry, save it with the VV, and infer the directory
-                if "FILE" in objtype:
-                    file, vv = s[1], s[5]
-                    files.append((file, vv))
-                    dirs.add(os.path.dirname(file))
+                for line in chunk:
+                    s = line.split("\t")
+                    objtype = s[0]
+                    # If this is a file entry, save it with the VV, and infer the directory
+                    if "FILE" in objtype:
+                        file, vv = s[1], s[5]
+                        files.append((file, vv))
+                        dirs.add(os.path.dirname(file))
 
-            if len(files) == 0:
-                LOGGER.critical("No in HPSS files matched query: %s", self.source)
+                # Removing junk from array
+                dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in DATABASE.desttrees ]
+                # Adding the root destination since files can be at depth 0, and we want to make sure its there
+                if self.destination not in DATABASE.desttrees:
+                    dirs.append(DestTree(created=False, path=self.destination))
+                if len(dirs) > 0:
+                    DATABASE.insertdesttree(dirs)
+                if len(files) > 0:
+                    DATABASE.insertfiles(files, self._hpss_root_dir, self.destination)
+            DATABASE.update_state(indexing_complete=True)
+            if DATABASE.gettotalnumberoffiles()[0] == 0:
+                LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.dest}")
+                LOGGER.critical(f"Use --overwrite-existing to overwrite files in the destination directory")
                 sys.exit(6)
-            # Removing junk from array
-            dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in DATABASE.desttrees ]
-            # Adding the root destination since files can be at depth 0, and we want to make sure its there
-            if self.destination not in DATABASE.desttrees:
-                dirs.append(DestTree(created=False, path=self.destination))
-            if len(dirs) > 0:
-                DATABASE.insertdesttree(dirs)
-            if len(files) > 0:
-                DATABASE.insertfiles(files, self._hpss_root_dir, self.destination)
+        else:
+            LOGGER.info("Skipping file indexing due to input cache")
         PROFILER.snapshot()
 
 
@@ -1186,11 +1179,18 @@ class HSIJob:
             stderr=STDOUT,
             bufsize=1,
             universal_newlines=True,
+            preexec_fn=os.setsid,
         )
+        global PIDS
+        PIDS.append(p.pid)
         errline = ""
         encountered_err = False
         ignore_rc = False
         for line in p.stdout:
+            #last ditch effort to kill HSI
+            if DYING:
+                LOGGER.info(f"Killing HSI process {p.pid}")
+                p.kill()
             if "PASSCODE" in line:
                 print(line)
             if encountered_err is True and ".Trash" in line:
@@ -1215,11 +1215,12 @@ class HSIJob:
                 output.clear()
 
         p.wait()
+        PIDS.remove(p.pid)
 
         if p.returncode != 0 and not ignore_rc:
             LOGGER.fatal(f"HSI failed to run! Returned rc={p.returncode}")
             LOGGER.fatal(
-                "Unable to get file data from HPSS! Please ensure that you can log into HPSS with 'hsi' using keytabs or token authentication, and that you have appropriate read permissions!",
+                "Unable to get file data from HPSS or process killed",
             )
             for line in output:
                 LOGGER.debug(line)
@@ -1242,7 +1243,6 @@ class HSIJob:
 def initLogger(verbose):
     global LOGGER
     if verbose:
-        # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
         LOGGER = logging.getLogger("hpss_transfer_sorted_files")
         LOGGER.setLevel(logging.DEBUG)
         ch = logging.StreamHandler()
@@ -1251,10 +1251,6 @@ def initLogger(verbose):
         ch.setFormatter(CustomFormatter())
         LOGGER.addHandler(ch)
         LOGGER.debug("Set logger to debug because --verbose")
-
-        #logging.basicConfig(
-        #    level=logging.DEBUG, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
-        #)
     else:
         LOGGER = logging.getLogger("hpss_transfer_sorted_files")
         LOGGER.setLevel(logging.INFO)
@@ -1263,10 +1259,6 @@ def initLogger(verbose):
 
         ch.setFormatter(CustomFormatter())
         LOGGER.addHandler(ch)
-        # logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
-        #logging.basicConfig(
-        #    level=logging.INFO, format="", datefmt="%m/%d/%Y %I:%M:%S %p"
-        #)
 
 class Profiler():
     def __init__(self, trace):
@@ -1406,7 +1398,6 @@ def main():
     global DB_TX_SIZE
     DB_TX_SIZE = args.db_tx_size
 
-
     global PROFILER
     PROFILER = Profiler(args.trace)
 
@@ -1418,9 +1409,8 @@ def main():
         LOGGER.info("Resuming interrupted transfer.")
 
     # Populate the db with HPSS data
-    if args.cache_path is None:
-        LOGGER.info("Indexing candidate files for transfer from HPSS...")
-        job.getSrcFiles()
+    LOGGER.info("Indexing candidate files for transfer from HPSS...")
+    job.getSrcFiles()
 
     # Check for files that exist in the destination
     LOGGER.info("Checking for existing files...")
@@ -1459,11 +1449,9 @@ def main():
     LOGGER.debug(json.dumps(finalreport, indent=2))
 
     # Write the report to a file
-    #if not args.dry_run:
     reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
         int(time.time())
     )
-    #reportfilename = os.path.join(args.preserved_files_path, reportfilename)
     reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
     with open(reportfilename, "w", encoding="UTF-8") as f:
         json.dump(finalreport, f, indent=2)
@@ -1474,11 +1462,17 @@ def main():
     CACHE.cleanup()
 
 def __handle_sigs(signum, frame):
-    LOGGER.error(f"Caught signal: {signum}")
+    LOGGER.error(f"Caught signal: {signum}, Exiting...")
+    global DYING
+    DYING = True
+    if len(PIDS) > 0:
+        for pid in PIDS:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
     if DATABASE is not None:
         DATABASE.cleanup()
     if CACHE is not None:
         CACHE.caught_exception(signum)
+    sys.exit(999)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, __handle_sigs)
@@ -1486,8 +1480,13 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        LOGGER.error(f"Caught exception: {e}")
+        DYING = True
+        LOGGER.error(f"Caught exception: {e}, Exiting...")
         LOGGER.debug(traceback.format_exc())
+        if len(PIDS) > 0:
+            for pid in PIDS:
+                LOGGER.error(f"Killing pid {pid}")
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
         if DATABASE is not None:
             DATABASE.cleanup()
         if CACHE is not None:
