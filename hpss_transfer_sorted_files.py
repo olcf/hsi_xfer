@@ -176,13 +176,16 @@ class Cache:
         self.cache_parent_path = cache_parent_path
         self.cleanup_filelists = cleanup_filelists
         self.cleanup_db = cleanup_db
-        self.existing_path = existing_path
+        self.existing_path = None if existing_path is None else os.path.abspath(existing_path)
         self.debug = debug
         self.original_archive = None
 
         self.filelists = []
 
-        if self.existing_path is None:
+        if self.existing_path is None or (self.existing_path is not None and not os.path.exists(self.existing_path)):
+            if (self.existing_path is not None and not os.path.exists(self.existing_path)):
+                LOGGER.info(f"Cache file does not exist: {self.existing_path}. Creating new cache file")
+                self.existing_path = None
             self.archive_path = os.path.join(
                 self.cache_parent_path, f"hpss_transfer_sorted_files_{int(time.time())}.cache"
             )
@@ -246,8 +249,9 @@ class Cache:
             time.sleep(5)
             try:
                 shutil.rmtree(self.archive_path)
-            except e as Exception:
+            except Exception as e:
                 LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
+                sys.exit(888)
 
         LOGGER.info(f"Saved cache at {self.archive_path}.tar.gz")
 
@@ -343,6 +347,10 @@ class Database:
         cur = None
         with Session(bind=self.engine) as s:
             cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()[0][0]
+            all_entries = s.execute(select(State).select_from(State).order_by(State.id.desc())).fetchall()
+            for row in all_entries:
+                if row[0].indexing_complete:
+                    cur.indexing_complete = row[0].indexing_complete
         return cur
 
 
@@ -767,8 +775,8 @@ class MigrateJob:
             for file in files:
                 destpath = file[0].dest
                 fileid = file[0].id
-                LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}")
                 if os.path.isfile(destpath):
+                    LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}")
                     DATABASE.markexists(fileid)
         else:
             LOGGER.debug("Skipping check for existing files due to --overwrite-existing")
@@ -896,7 +904,7 @@ class MigrateJob:
                         # We're going to be writing multiple gets and hashcreate commands here
                         # Write each to a separate file, and append to infile at the end?
                         if len(files) > 0:
-                            LOGGER.debug("Writing chunk of %s to temporary file list...", len(chunk))
+                            LOGGER.debug("Writing list of %s files to temporary file list...", len(chunk))
 
                             # Do a hashlist to get files that have hashes already
                             hashlistout = self.runHashList(files)
@@ -956,7 +964,7 @@ class MigrateJob:
                         "in {}".format(infilename),
                     )
                     LOGGER.info(
-                        "Starting migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
+                        "Launching a sorted batch migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
                     )
                     if not self.dry_run:
                         for f in files:
@@ -1082,7 +1090,7 @@ class MigrateJob:
             start = int(time.time())
             cur = start
             for chunk in self.ls_job.run(): 
-                LOGGER.debug(f"Got chunk of size {len(chunk)} from HSI. Retrival took {int(time.time())-cur}s")
+                LOGGER.debug(f"Got {len(chunk)} files from HSI. Retrival took {int(time.time())-cur}s")
                 files = []
                 dirs = set()
 
@@ -1389,7 +1397,7 @@ def main():
         help="Output additional information about the transfer",
         action="store_true",
     )
-    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!\n\npositional arguments"  # pylint: disable=W0212
+    parser._positionals.title = "NOTE: While this script will work with PASSCODE auth, it is HIGHLY recommended to use standard 'keytab' auth (e.g. do not use --additional-hsi-flags unless you absolutely must!)\n\npositional arguments"  # pylint: disable=W0212
     # Get our cli args
     args = parser.parse_args()
 
@@ -1472,26 +1480,28 @@ def main():
     CACHE.cleanup()
 
 def __handle_sigs(signum, frame):
-    LOGGER.error(f"Caught signal: {signum}, Exiting...")
     global DYING
-    DYING = True
-    if len(PIDS) > 0:
-        for pid in PIDS:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-    if DATABASE is not None:
-        DATABASE.cleanup()
-    if CACHE is not None:
-        CACHE.caught_exception(signum)
-    sys.exit(999)
+    if not DYING:
+        LOGGER.error(f"Caught signal: {signum}, Exiting... Please wait for cleanup to finish.")
+        DYING = True
+        if len(PIDS) > 0:
+            for pid in PIDS:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        if DATABASE is not None:
+            DATABASE.cleanup()
+        if CACHE is not None:
+            CACHE.caught_exception(signum)
+        sys.exit(999)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, __handle_sigs)
     signal.signal(signal.SIGINT, __handle_sigs)
     try:
         sys.exit(main())
+    #Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
     except Exception as e:
         DYING = True
-        LOGGER.error(f"Caught exception: {e}, Exiting...")
+        LOGGER.error(f"Caught exception: {e}, Exiting... Please wait for cleanup to finish.")
         LOGGER.debug(traceback.format_exc())
         if len(PIDS) > 0:
             for pid in PIDS:
