@@ -391,7 +391,6 @@ class Database:
         LOGGER.debug(f"Batch inserting files into 'files' table (num_files={len(files)})...")
 
         files_to_insert = []
-        destination_to_insert = []
         for file in files[:]:
             vv = file[1].split(',')[0]
             fpath = file[0]
@@ -418,17 +417,17 @@ class Database:
             files.remove(file)
 
         # Perform the actual inserts
-            with Session(bind=self.engine) as s:
-                try:
-                    s.add_all(files_to_insert)
-                    s.flush()
-                    s.commit()
-                except Exception as e:
-                    if not DYING:
-                        LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}")
-                        LOGGER.debug("(insertfiles)")
-                        LOGGER.debug(f"{e}")
-                        sys.exit(111)
+        with Session(bind=self.engine) as s:
+            try:
+                s.add_all(files_to_insert)
+                s.flush()
+                s.commit()
+            except Exception as e:
+                if not DYING:
+                    LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}")
+                    LOGGER.debug("(insertfiles)")
+                    LOGGER.debug(f"{e}")
+                    sys.exit(111)
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
@@ -1080,11 +1079,14 @@ class MigrateJob:
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
         if not DATABASE.get_state().indexing_complete:
+            start = int(time.time())
+            cur = start
             for chunk in self.ls_job.run(): 
-                LOGGER.debug("Got chunk from hsi")
+                LOGGER.debug(f"Got chunk of size {len(chunk)} from HSI. Retrival took {int(time.time())-cur}s")
                 files = []
                 dirs = set()
 
+                pstart = int(time.time())
                 for line in chunk:
                     s = line.split("\t")
                     objtype = s[0]
@@ -1093,7 +1095,9 @@ class MigrateJob:
                         file, vv = s[1], s[5]
                         files.append((file, vv))
                         dirs.add(os.path.dirname(file))
+                LOGGER.debug(f"Chunk processing took {int(time.time())-pstart}s")
 
+                dstart = int(time.time())
                 # Removing junk from array
                 dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in DATABASE.desttrees ]
                 # Adding the root destination since files can be at depth 0, and we want to make sure its there
@@ -1103,6 +1107,9 @@ class MigrateJob:
                     DATABASE.insertdesttree(dirs)
                 if len(files) > 0:
                     DATABASE.insertfiles(files, self._hpss_root_dir, self.destination)
+                LOGGER.debug(f"Database operation took {int(time.time())-dstart}s")
+                cur = int(time.time())
+            LOGGER.debug(f"Updating database state table")
             DATABASE.update_state(indexing_complete=True)
             if DATABASE.gettotalnumberoffiles()[0] == 0:
                 LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.dest}")
@@ -1186,6 +1193,7 @@ class HSIJob:
         errline = ""
         encountered_err = False
         ignore_rc = False
+        sinceLastYield = int(time.time())
         for line in p.stdout:
             #last ditch effort to kill HSI
             if DYING:
@@ -1211,6 +1219,8 @@ class HSIJob:
             # Where the output is processed as it comes in. 
             output.append(line.strip())
             if len(output) >= DB_TX_SIZE:
+                LOGGER.debug(f"HSI list speed: {DB_TX_SIZE/(int(time.time())-sinceLastYield)} lines/sec")
+                sinceLastYield = int(time.time())
                 yield output
                 output.clear()
 
