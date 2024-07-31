@@ -49,7 +49,7 @@ PIDS = []
 # set --vvs-per-job=-1
 
 # =============================================================================
-# hpss_transfer_sorted_files.py
+# hsi_xfer.py
 #
 # This is a script that wraps HSI and queries HPSS for files and VV location
 # based upon a given HPSS-path. Once queried, it will batch up files based
@@ -187,7 +187,7 @@ class Cache:
                 LOGGER.info(f"Cache file does not exist: {self.existing_path}. Creating new cache file")
                 self.existing_path = None
             self.archive_path = os.path.join(
-                self.cache_parent_path, f"hpss_transfer_sorted_files_{int(time.time())}.cache"
+                self.cache_parent_path, f"hsi_xfer_{int(time.time())}.cache"
             )
             self.cache_path = os.path.join(
                 self.archive_path, "cache"
@@ -800,7 +800,7 @@ class MigrateJob:
 
     def runHashList(self, files):
         infilename = os.path.join(
-            self.filelists_path, f"hpss_transfer_sorted_files.hashlist.list"
+            self.filelists_path, f"hsi_xfer.hashlist.list"
         )
         # Write the infile to be passed into HSI
         with open(infilename, "w", encoding="UTF-8") as infile:
@@ -893,7 +893,7 @@ class MigrateJob:
                     self.filelists_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
                 )
                 infilename = os.path.join(
-                    self.filelists_path, f"hpss_transfer_sorted_files.{filelistnum}.list"
+                    self.filelists_path, f"hsi_xfer.{filelistnum}.list"
                 )
                 with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
                     for chunk in DATABASE.getfilesbyvv(vv[0]):
@@ -1120,7 +1120,7 @@ class MigrateJob:
             LOGGER.debug(f"Updating database state table")
             DATABASE.update_state(indexing_complete=True)
             if DATABASE.gettotalnumberoffiles()[0] == 0:
-                LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.dest}")
+                LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.destination}")
                 LOGGER.critical(f"Use --overwrite-existing to overwrite files in the destination directory")
                 sys.exit(6)
         else:
@@ -1261,7 +1261,7 @@ class HSIJob:
 def initLogger(verbose):
     global LOGGER
     if verbose:
-        LOGGER = logging.getLogger("hpss_transfer_sorted_files")
+        LOGGER = logging.getLogger("hsi_xfer")
         LOGGER.setLevel(logging.DEBUG)
         ch = logging.StreamHandler()
         ch.setLevel(logging.DEBUG)
@@ -1270,7 +1270,7 @@ def initLogger(verbose):
         LOGGER.addHandler(ch)
         LOGGER.debug("Set logger to debug because --verbose")
     else:
-        LOGGER = logging.getLogger("hpss_transfer_sorted_files")
+        LOGGER = logging.getLogger("hsi_xfer")
         LOGGER.setLevel(logging.INFO)
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
@@ -1403,6 +1403,14 @@ def main():
 
     initLogger(args.verbose)
 
+    if not os.path.isabs(args.source):
+        LOGGER.critical(f"HPSS source path must be absolute! ({args.source})")
+        sys.exit(777)
+
+    if not os.path.isabs(args.destination):
+        LOGGER.critical(f"Destination path must be absolute! ({args.destination})")
+        sys.exit(777)
+
     global CACHE
     cleanup_db = True
     cleanup_filelists = not args.preserve_file_lists # The logic here is inverse so we ! the flags value
@@ -1467,7 +1475,7 @@ def main():
     LOGGER.debug(json.dumps(finalreport, indent=2))
 
     # Write the report to a file
-    reportfilename = "hpss_transfer_sorted_files_report_{}.json".format(
+    reportfilename = "hsi_xfer_report_{}.json".format(
         int(time.time())
     )
     reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
