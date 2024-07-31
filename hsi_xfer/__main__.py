@@ -395,19 +395,19 @@ class Database:
     
 
     # Insert file entries into the files table
-    def insertfiles(self, files, srcroot, destroot):
+    def insertfiles(self, files, srcroot, destroot, qualified_source):
         LOGGER.debug(f"Batch inserting files into 'files' table (num_files={len(files)})...")
 
         files_to_insert = []
         for file in files[:]:
             vv = file[1].split(',')[0]
-            fpath = file[0]
+            fpath = file[0].replace(srcroot, qualified_source, 1)
             if len(vv) != 8:
                 LOGGER.debug(f"No VV found for file {fpath}; skipping and will not track!")
                 LOGGER.error(f"Could not read HPSS metadata for file {fpath}; skipping...")
                 continue
             vvid = self.vvExists(vv) 
-            dest = fpath.replace(srcroot, destroot)
+            dest = fpath.replace(qualified_source, destroot, 1)
             if vvid is None:
                 self.insertvv(vv)
                 vvid = self.vvExists(vv) 
@@ -559,6 +559,7 @@ class Database:
 
     # Marks the file trasfer as completed
     def markfileastransfercompleted(self, srcpath):
+        LOGGER.debug(f"Marking complete: {srcpath}={TransferStatus.completed.value}")
         stmt = update(Files).values(transfer_status=TransferStatus.completed.value).where(Files.path == srcpath)
         try:
             with Session(self.engine) as s:
@@ -740,8 +741,6 @@ class Database:
 # Object to manage the HSIJobs required for migration of files in the DB
 class MigrateJob:
     def __init__(self, args):
-        self.source = os.path.normpath(args.source)
-        self.destination = os.path.abspath(os.path.normpath(args.destination))
         self.dry_run = args.dry_run
         self.verbose = args.verbose
         self.filelists_path = CACHE.get_unpacked_filelist_root_path()
@@ -754,6 +753,11 @@ class MigrateJob:
         self.checksum_threads = args.checksum_threads
         self.hsi = "/sw/sources/hpss/bin/hsi"
 
+        self.relative_input_source = f"./{os.path.normpath(args.source)}" if args.source[0] not in ["/","."] else os.path.normpath(args.source)
+        self.input_source = args.source
+        self.source = self._get_qualified_hpss_path(self.relative_input_source)
+        self.destination = os.path.abspath(os.path.normpath(args.destination))
+
         global DATABASE
         DATABASE = Database(self.verbose, self.disable_checksums, debug=args.debug)
 
@@ -763,7 +767,7 @@ class MigrateJob:
             self.addl_flags,
             True,
             self.verbose,
-            "ls -a -N -R -P {}".format(self.source),
+            "ls -a -N -R -P {}".format(self.input_source), # use input_source here to ensure globbing works
         )
 
     # Check the destination filesystem for files that match names at the predicted destination directory
@@ -987,7 +991,7 @@ class MigrateJob:
                                     DATABASE.setsrcchecksum(srcpath, checksum)
                                     DATABASE.markfileashpsschecksumcomplete(srcpath)
 
-                                matches = re.match("get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
+                                matches = re.match(r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
                                 if matches:
                                     srcpath = matches.group(2)
                                     filesCompleted += 1
@@ -1000,6 +1004,10 @@ class MigrateJob:
                                         line.split(" ")[-1],
                                     )
                                     DATABASE.markasfailed(line.split(" ")[-1])
+                        LOGGER.info("%s/%s file transfers have been attempted",
+                                        filesCompleted,
+                                        filesTotal,
+                                    )
                         PROFILER.snapshot()
                     else:
                         LOGGER.info("Would have run: %s", migration_job.getcommand())
@@ -1079,13 +1087,38 @@ class MigrateJob:
 
     @property
     def _hpss_root_dir(self):
-        path = self.source
+        path = os.path.normpath(self.input_source)
         while any(char in "*?[]" for char in path):
             path = os.path.dirname(path)
         return path
 
+    def _get_qualified_hpss_path(self, path):
+        #path = os.path.normpath(path) if path[0] not in [".","/"] else path
+        #path = os.path.normpath(path)
+        while any(char in "*?[]" for char in path):
+            path = os.path.dirname(path)
+
+        ls_job = HSIJob(
+            self.hsi,
+            self.addl_flags,
+            True,
+            self.verbose,
+            "ls -aNPd {}".format(path),
+        )
+
+        for chunk in ls_job.run():
+            for line in chunk:
+                if os.path.normpath(path) in line and "DIRECTORY" in line:
+                    return line.split("\t")[-1]
+
+        # Last ditch effort, just basically do _hpss_root_dir on path
+        return path
+
+
+
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
+        LOGGER.debug(f"_hpss_root_dir={self._hpss_root_dir}")
         if not DATABASE.get_state().indexing_complete:
             start = int(time.time())
             cur = start
@@ -1107,14 +1140,14 @@ class MigrateJob:
 
                 dstart = int(time.time())
                 # Removing junk from array
-                dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination)) for d in dirs if d.replace(self._hpss_root_dir, self.destination) not in DATABASE.desttrees ]
+                dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination, 1)) for d in dirs if d.replace(self._hpss_root_dir, self.destination, 1) not in DATABASE.desttrees ]
                 # Adding the root destination since files can be at depth 0, and we want to make sure its there
                 if self.destination not in DATABASE.desttrees:
                     dirs.append(DestTree(created=False, path=self.destination))
                 if len(dirs) > 0:
                     DATABASE.insertdesttree(dirs)
                 if len(files) > 0:
-                    DATABASE.insertfiles(files, self._hpss_root_dir, self.destination)
+                    DATABASE.insertfiles(files, self._hpss_root_dir, self.destination, self.source)
                 LOGGER.debug(f"Database operation took {int(time.time())-dstart}s")
                 cur = int(time.time())
             LOGGER.debug(f"Updating database state table")
@@ -1402,14 +1435,6 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose)
-
-    if not os.path.isabs(args.source):
-        LOGGER.critical(f"HPSS source path must be absolute! ({args.source})")
-        sys.exit(777)
-
-    if not os.path.isabs(args.destination):
-        LOGGER.critical(f"Destination path must be absolute! ({args.destination})")
-        sys.exit(777)
 
     global CACHE
     cleanup_db = True
