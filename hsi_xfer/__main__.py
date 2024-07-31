@@ -1108,8 +1108,12 @@ class MigrateJob:
 
         for chunk in ls_job.run():
             for line in chunk:
-                if os.path.normpath(path) in line and "DIRECTORY" in line:
-                    return line.split("\t")[-1]
+                if os.path.normpath(path) in line:
+                    if "DIRECTORY" in line:
+                        return line.split("\t")[-1]
+                    elif "FILE" in line:
+                        LOGGER.critical("Invalid source path provided. Single file transfers are not supported! Please replace the source path with a directory")
+                        sys.exit(555)
 
         # Last ditch effort, just basically do _hpss_root_dir on path
         return path
