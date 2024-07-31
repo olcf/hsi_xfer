@@ -16,4 +16,5 @@ else
 	conda activate ${DEV_DEST}
 	pip3 install -r requirements.txt
 	python3 ./setup.py install --install-scripts ${DEV_DEST}/bin/hsi_xfer
+	chmod 770 /sw/sources/hpss/hsi-xfer/bin/hsi_xfer/hsi_xfer
 fi
