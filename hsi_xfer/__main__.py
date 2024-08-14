@@ -41,7 +41,7 @@ PROFILER = None
 DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
 CACHE = None
 DATABASE = None
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DYING = False
 PIDS = []
 
@@ -165,6 +165,7 @@ class Files(Base):
     dest: Mapped[str]
     destdir: Mapped[Optional[int]] = mapped_column(ForeignKey("desttree.id"))
     destfileexists: Mapped[bool]
+    sizebytes: Mapped[int]
 
 #
 # Meta-class to track database and filelists created and to package them into an archive in case of interruption
@@ -182,6 +183,7 @@ class Cache:
 
         self.filelists = []
 
+        # Cache does not exist
         if self.existing_path is None or (self.existing_path is not None and not os.path.exists(self.existing_path)):
             if (self.existing_path is not None and not os.path.exists(self.existing_path)):
                 LOGGER.info(f"Cache file does not exist: {self.existing_path}. Creating new cache file")
@@ -195,6 +197,7 @@ class Cache:
             self.dbpath = os.path.join(self.cache_path, "database.db")
             self.filelists_root_path = os.path.join(self.cache_path, "filelists")
         else:
+            # Cache exists; resuming
             self.archive_path = self.existing_path
             self.unpack()
             self.cache_path = os.path.join(
@@ -256,12 +259,7 @@ class Cache:
         LOGGER.info(f"Saved cache at {self.archive_path}.tar.gz")
 
     def unpack(self):
-        # TODO: Untar self.cache_path into cache_parent_path
-        #       (maybe use a tmpdir and reset the db path (will require fixing the line at 207)
-        #       There could be collision issues with name of the existing_path and the unpacked cache
-        #       Trying to add a 'cache' dir as the root of the cache. dest: cache_parent_path/cache/{filelists,database.db}
-        # TODO: Change this so that it unpacks the archivename.tar.gz into archivename/ 
-        self.original_archive = self.archive_path # Save the path to the input archive. TODO: Use this in self.pack as destination?
+        self.original_archive = self.archive_path # Save the path to the input archive.
         self.archive_path = os.path.abspath(self.archive_path) # Gets the fully qualified path to the tar'd archive
         # Save original path
         cache_basename = '.'.join(list(filter(None,os.path.basename(self.archive_path).split(".")[:-2])))
@@ -420,7 +418,9 @@ class Database:
                 LOGGER.critical("No destination found; Cowardly failing...")
                 sys.exit(2)
 
-            files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False))
+            size = file[2]
+
+            files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False, sizebytes=size))
 
             files.remove(file)
 
@@ -457,7 +457,7 @@ class Database:
 
     # Gets all files that failed checksumming
     def getfailedchecksums(self):
-        stmt = select(Files.path, Files.src_checksum, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.failed.value)
+        stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.failed.value)
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
@@ -629,12 +629,13 @@ class Database:
 
     # Get file entries where the source and dest checksums do not match
     def getnonmatchingchecksums(self):
-        stmt = select(Files.path, Files.src_checksum, Files.dest_checksum).select_from(Files).where(Files.dest_checksum != Files.src_checksum)
-
-        if self.disable_checksums:
-            stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where((Files.dest_checksum != Files.src_checksum) | (Files.dest_checksum == None & Files.src_checksum == None & Files.destfileexists == True))
+        stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where(Files.dest_checksum != Files.src_checksum)
 
         rows = []
+        if self.disable_checksums:
+            return []
+        #    stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where((Files.dest_checksum != Files.src_checksum) | (Files.dest_checksum == None & Files.src_checksum == None & Files.destfileexists == True))
+
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
 
@@ -774,14 +775,19 @@ class MigrateJob:
     def checkForExisting(self):
         if not self.overwrite:
             files = DATABASE.dumpfiles()
-            #LOGGER.debug(files)
 
             for file in files:
                 destpath = file[0].dest
                 fileid = file[0].id
-                if os.path.isfile(destpath):
-                    LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}")
-                    DATABASE.markexists(fileid)
+                destsize = file[0].sizebytes
+                # Check if file exists in the destination. If it does exist, check if the file sizes are the same. If they're different
+                # Assume that the file is incomplete and overwrite it
+                if os.path.isfile(destpath): 
+                    srcsize = os.path.getsize(destpath)
+                    if srcsize == destsize:
+                        # Check if indexing complete, and if so, check if the file is 'staging', then do not add, else, mark exists
+                        LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}, size={srcsize}")
+                        DATABASE.markexists(fileid)
         else:
             LOGGER.debug("Skipping check for existing files due to --overwrite-existing")
 
@@ -1037,7 +1043,8 @@ class MigrateJob:
         ret["checksum_mismatch"] = []
         if len(files) > 0:
             for file in files:
-                LOGGER.debug(
+                LOGGER.debug(file)
+                LOGGER.error(
                     "Checksum did not match! Can not guarantee file integrity!"
                 )
                 LOGGER.debug(" - %s(%s) : %s(%s)", file[0], file[1], file[2], file[3])
@@ -1137,8 +1144,8 @@ class MigrateJob:
                     objtype = s[0]
                     # If this is a file entry, save it with the VV, and infer the directory
                     if "FILE" in objtype:
-                        file, vv = s[1], s[5]
-                        files.append((file, vv))
+                        file, size, vv = s[1], s[2], s[5]
+                        files.append((file, vv, size))
                         dirs.add(os.path.dirname(file))
                 LOGGER.debug(f"Chunk processing took {int(time.time())-pstart}s")
 
@@ -1173,6 +1180,19 @@ def doDestChecksum(file):
     checksum = ""
 
     cmd = "md5sum {}".format(file[1]).split(" ")
+    LOGGER.debug(f"Running { ' '.join(cmd) }")
+
+    # Check if file exists or not; When using the TA + NFS sometimes things get weird
+    if not os.path.exists(file[1]):
+        time.sleep(10)
+        if not os.path.exists(file[1]):
+            LOGGER.error(f"Could not checksum file {file[1]}! Can not guarantee file integrity")
+            return {
+                "path": file[1],
+                "checksum": None,
+                "returncode": -1,
+                "id": file[2],
+            }
 
     output = []
     p = run(
@@ -1186,6 +1206,8 @@ def doDestChecksum(file):
 
     output = p.stdout.strip()
     checksum = output.split(" ")[0]
+    if p.returncode != 0:
+        LOGGER.debug(f"{output}")
     return {
         "path": file[1],
         "checksum": checksum,
@@ -1221,7 +1243,6 @@ class HSIJob:
             cmd.extend(self.flags.split(" "))
         cmd.extend(self.cmd.split(" "))
 
-        #TODO: Change self.verbose to self.dry_run 
         LOGGER.debug(f"Running: {' '.join(cmd)}")
 
         output = []
@@ -1259,7 +1280,6 @@ class HSIJob:
                 encountered_err = True
                 errline = line
 
-            #TODO: Don't append all lines to output.
             # Use output as a buffer, and maybe yield the buffer to the parent function
             # Where the output is processed as it comes in. 
             output.append(line.strip())
@@ -1488,13 +1508,12 @@ def main():
     # Start checksumming destination files
     # TODO: Can we overlap these threads at some point?
     # We will need the destchecksumthread to poll the filesystem and DB to detect when files are done transferring
-    if not args.dry_run and not args.disable_checksums:
-        destchecksumThread.start()
-
-    # Generate our report
     report = {}
     if not args.dry_run and not args.disable_checksums:
+        destchecksumThread.start()
+        #Wait for checksumming to finish. If you wanna do more things, do them here?
         destchecksumThread.join()
+        # Generate our report
         report = job.checksumMismatchReport()
 
     # generate report
