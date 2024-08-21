@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import logging.handlers
 import traceback
 import json
 import logging
@@ -41,7 +42,7 @@ PROFILER = None
 DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
 CACHE = None
 DATABASE = None
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DYING = False
 PIDS = []
 
@@ -145,6 +146,7 @@ class State(Base):
     schema_version: Mapped[int]
     indexing_complete: Mapped[bool]
     filelist_count: Mapped[int]
+    starttime: Mapped[int]
 
 
 class DestTree(Base):
@@ -290,12 +292,13 @@ class Cache:
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
 class Database:
-    def __init__(self, verbose, disable_checksums, debug=False):
+    def __init__(self, verbose, starttime, disable_checksums, debug=False):
         self.disable_checksums = disable_checksums
         self.verbose = verbose
         self.vvs = {}
         self.desttrees = {}
         self.debug = debug
+        self.starttime = starttime
 
         self.dbpath = CACHE.get_unpacked_db_path()
 
@@ -327,19 +330,33 @@ class Database:
         schema_version = SCHEMA_VERSION
         indexing_complete = False
         filelist_count = 0
-        LOGGER.debug(f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}")
-        row = State(schema_version=schema_version, indexing_complete=indexing_complete, filelist_count=filelist_count)
+        starttime = self.starttime
+        LOGGER.debug(f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}, starttime={starttime}")
+        row = State(schema_version=schema_version, indexing_complete=indexing_complete, filelist_count=filelist_count, starttime=starttime)
         with Session(bind=self.engine) as s:
             cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()
             if len(cur) > 0:
                 cur = cur[0][0]
-                LOGGER.debug(f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}")
+                LOGGER.debug(f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}, starttime={starttime}")
                 if cur.schema_version != schema_version:
                     LOGGER.error(f"Attempting to use a cache from an old version of this tool. This will probably fail!")
             s.add(row)
             s.flush()
             s.commit()
 
+    def getstarttime(self) -> int:
+        curstate = self.get_state()
+        return curstate.starttime
+
+    def gettotalsize(self) -> int:
+        with Session(bind=self.engine) as s:
+            stmt = select(func.sum(Files.sizebytes)).select_from(Files).where(Files.transfer_status == TransferStatus.completed.value)
+            row = s.execute(stmt).fetchall()[0][0]
+            LOGGER.debug(row)
+            if row is not None:
+                return row
+            else:
+                return 0
 
     def get_state(self):
         cur = None
@@ -760,7 +777,7 @@ class MigrateJob:
         self.destination = os.path.abspath(os.path.normpath(args.destination))
 
         global DATABASE
-        DATABASE = Database(self.verbose, self.disable_checksums, debug=args.debug)
+        DATABASE = Database(self.verbose, int(time.time()), self.disable_checksums, debug=args.debug)
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -1061,28 +1078,41 @@ class MigrateJob:
     # Generates our overall report. This will get written out to a JSON file for users
     def genReport(self, mismatchreport):
         report = mismatchreport
+
         failedtransfers = DATABASE.getfailedtransfers()
         report["failed_transfers"] = []
         for f in failedtransfers:
             report["failed_transfers"].append({"source": f[0], "destination": f[1]})
+
         failedchecksums = DATABASE.getfailedchecksums()
         report["failed_to_checksum"] = []
         for f in failedchecksums:
             report["failed_to_checksum"].append(
                 {"source": (f[0], f[1]), "destination": (f[2], f[3])}
             )
+
         succeededfiles = DATABASE.getsuccessfultransfers()
         report["successful_transfers"] = []
         for f in succeededfiles:
             report["successful_transfers"].append(
                 {"source": f[0], "destination": f[1], "checksum": f[2]}
             )
+
         existingfiles = DATABASE.getexistingfiles()
         report["existing_files_skipped"] = []
         for f in existingfiles:
             report["existing_files_skipped"].append(
                 {"source": f[0], "destination": f[1]}
             )
+
+        if not self.dry_run:
+            totalsize = DATABASE.gettotalsize()
+            starttime = DATABASE.getstarttime()
+            endtime = int(time.time())
+            elapsed = (endtime - starttime)
+            bps = (totalsize/1000/1000)/elapsed
+            report["average_speed"] = bps
+
         if self.dry_run:
             files = DATABASE.dumpfiles()
             report["would_have_transferred"] = []
@@ -1317,23 +1347,24 @@ class HSIJob:
 
 def initLogger(verbose):
     global LOGGER
+
+    loglevel = logging.INFO
     if verbose:
-        LOGGER = logging.getLogger("hsi_xfer")
-        LOGGER.setLevel(logging.DEBUG)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.DEBUG)
+        loglevel = logging.DEBUG
 
-        ch.setFormatter(CustomFormatter())
-        LOGGER.addHandler(ch)
+    LOGGER = logging.getLogger("hsi_xfer")
+    LOGGER.setLevel(loglevel)
+    ch = logging.StreamHandler()
+    ch.setLevel(loglevel)
+
+    ch.setFormatter(CustomFormatter())
+    sh = logging.handlers.SysLogHandler(address='/dev/log')
+    sh.setLevel(logging.INFO)
+    LOGGER.addHandler(ch)
+    LOGGER.addHandler(sh)
+
+    if verbose:
         LOGGER.debug("Set logger to debug because --verbose")
-    else:
-        LOGGER = logging.getLogger("hsi_xfer")
-        LOGGER.setLevel(logging.INFO)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-
-        ch.setFormatter(CustomFormatter())
-        LOGGER.addHandler(ch)
 
 class Profiler():
     def __init__(self, trace):
@@ -1530,6 +1561,7 @@ def main():
     with open(reportfilename, "w", encoding="UTF-8") as f:
         json.dump(finalreport, f, indent=2)
     LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
+    LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
     PROFILER.print_report()
     DATABASE.cleanup()
