@@ -1129,6 +1129,7 @@ class MigrateJob:
             bps = (totalsize/1000/1000)/elapsed
             report["average_speed"] = bps
             report["elapsed_time"] = elapsed
+            report["total_size_in_bytes"] = totalsize
 
         if self.dry_run:
             files = DATABASE.dumpfiles()
@@ -1524,9 +1525,10 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose)
-    if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size or args.trace:
+    if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
         LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
         LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --checksum-threads={args.checksum_threads}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --debug={args.debug}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --db-tx-size={args.db_tx_size}", extra={'block':'cli'})
@@ -1605,6 +1607,7 @@ def main():
     LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
     LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
+    LOGGER.info(f"Total size in bytes: {finalreport['total_size_in_bytes']}", extra={'block':'cli'})
     LOGGER.info(f"Elapsed time: {finalreport['elapsed_time']}s", extra={'block':'cli'})
     LOGGER.info(f"Successful files: {len(finalreport['successful_transfers'])}", extra={'block':'cli'})
     LOGGER.info(f"Failed files: {len(finalreport['failed_transfers'])}", extra={'block':'cli'})
