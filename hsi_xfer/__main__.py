@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import getpass
 import logging.handlers
 import traceback
 import json
@@ -878,7 +879,16 @@ class MigrateJob:
 
         # Get chunked list of vvs
         allvvs = DATABASE.getvvswithnoncompletefiles()
+
+        #TODO: This may be a problem, if we use --vvs-per-job > 1
         vvs = list(chunk(allvvs, int(self.vvs_per_job)))
+        #TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
+        if len(vvs) > len(allvvs):
+            vvs = []
+            for lst in chunk(allvvs, int(self.vvs_per_job)):
+                vvs.append(list(lst))
+
+        LOGGER.info("Will generate {len(vvs)} file lists", extra={'block':'cli'})
 
         # Get list of exisitng files from the db
         existingFiles = DATABASE.getexistingfiles()
@@ -894,7 +904,7 @@ class MigrateJob:
                 existing.append({"source": f[0], "destination": f[1]})
             LOGGER.debug(json.dumps(existing, indent=2))
 
-        LOGGER.debug(
+        LOGGER.info(
             "Creating file lists from indexed HPSS data..."
         )
 
@@ -902,12 +912,15 @@ class MigrateJob:
         filelistnum = 0
         filesCompleted = len(existingFiles)
         filesTotal = DATABASE.gettotalnumberoffiles()[0]
+        LOGGER.info("Will transfer {len(vvs)} files from HPSS", extra={'block':'cli'})
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
         DATABASE.update_state(filelist_count=len(vvs))
+        firstrun = True
+
         for vvlist in vvs:
             files = []
             # Unpack chunk. Will generally just be a list of 1 vvid, but in case --vvs-per-job is set, this will chunk it up
@@ -990,9 +1003,11 @@ class MigrateJob:
                         self.verbose,
                         "in {}".format(infilename),
                     )
-                    LOGGER.info(
-                        "Launching a sorted batch migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
-                    )
+                    if firstrun:
+                        LOGGER.info(
+                            "Launching a sorted batch migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
+                        )
+                        firstrun = False
                     if not self.dry_run:
                         for f in files:
                             DATABASE.markfileasstaging(f[2])
@@ -1018,7 +1033,8 @@ class MigrateJob:
                                 if matches:
                                     srcpath = matches.group(2)
                                     filesCompleted += 1
-                                    LOGGER.debug("Processed file (%s/%s): %s", filesCompleted, filesTotal, srcpath)
+                                    LOGGER.debug("Processed (%s/%s) files: %s", filesCompleted, filesTotal, srcpath)
+                                    LOGGER.info("Processed (%s/%s) files: %s", filesCompleted, filesTotal, srcpath, extra={'block':'cli'})
                                     DATABASE.markfileastransfercompleted(srcpath)
 
                                 if "get: Error" in line:
@@ -1030,7 +1046,7 @@ class MigrateJob:
                         LOGGER.info("%s/%s file transfers have been attempted",
                                         filesCompleted,
                                         filesTotal,
-                                    )
+                        )
                         PROFILER.snapshot()
                     else:
                         LOGGER.info("Would have run: %s", migration_job.getcommand())
@@ -1112,6 +1128,7 @@ class MigrateJob:
             elapsed = (endtime - starttime)
             bps = (totalsize/1000/1000)/elapsed
             report["average_speed"] = bps
+            report["elapsed_time"] = elapsed
 
         if self.dry_run:
             files = DATABASE.dumpfiles()
@@ -1345,6 +1362,14 @@ class HSIJob:
         return " ".join(cmd)
 
 
+def handler_filter(handler):
+    def logger_filter(extra):
+        if hasattr(extra, 'block'):
+            if extra.block == handler:
+                return False
+        return True
+    return logger_filter
+
 def initLogger(verbose):
     global LOGGER
 
@@ -1352,16 +1377,25 @@ def initLogger(verbose):
     if verbose:
         loglevel = logging.DEBUG
 
+    username = getpass.getuser()
+
     LOGGER = logging.getLogger("hsi_xfer")
     LOGGER.setLevel(loglevel)
-    ch = logging.StreamHandler()
-    ch.setLevel(loglevel)
 
-    ch.setFormatter(CustomFormatter())
-    sh = logging.handlers.SysLogHandler(address='/dev/log')
-    sh.setLevel(logging.INFO)
-    LOGGER.addHandler(ch)
-    LOGGER.addHandler(sh)
+    cliHandler = logging.StreamHandler()
+    cliHandler.setLevel(loglevel)
+    cliHandler.setFormatter(CustomFormatter())
+    cliHandler.name = 'cliHandler'
+    cliHandler.addFilter(handler_filter('cli'))
+
+    syslogHandler = logging.handlers.SysLogHandler(address='/dev/log')
+    syslogHandler.setFormatter(logging.Formatter(f'hsi_xfer: (user={username}) %(message)s'))
+    syslogHandler.setLevel(logging.INFO)
+    syslogHandler.name = 'syslogHandler'
+    syslogHandler.addFilter(handler_filter('syslog'))
+
+    LOGGER.addHandler(cliHandler)
+    LOGGER.addHandler(syslogHandler)
 
     if verbose:
         LOGGER.debug("Set logger to debug because --verbose")
@@ -1490,6 +1524,14 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose)
+    if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size or args.trace:
+        LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --debug={args.debug}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --db-tx-size={args.db_tx_size}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --trace={args.trace}", extra={'block':'cli'})
+        
 
     global CACHE
     cleanup_db = True
@@ -1563,6 +1605,12 @@ def main():
     LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
     LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
+    LOGGER.info(f"Elapsed time: {finalreport['elapsed_time']}s", extra={'block':'cli'})
+    LOGGER.info(f"Successful files: {len(finalreport['successful_transfers'])}", extra={'block':'cli'})
+    LOGGER.info(f"Failed files: {len(finalreport['failed_transfers'])}", extra={'block':'cli'})
+    LOGGER.info(f"Failed to checksum files: {len(finalreport['failed_to_checksum'])}", extra={'block':'cli'})
+    LOGGER.info(f"Existing files skipped: {len(finalreport['existing_files_skipped'])}", extra={'block':'cli'})
+
     PROFILER.print_report()
     DATABASE.cleanup()
     CACHE.cleanup()
@@ -1571,6 +1619,8 @@ def __handle_sigs(signum, frame):
     global DYING
     if not DYING:
         LOGGER.error(f"Caught signal: {signum}, Exiting... Please wait for cleanup to finish.")
+        LOGGER.debug(traceback.format_exc())
+        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
         DYING = True
         if len(PIDS) > 0:
             for pid in PIDS:
@@ -1581,7 +1631,8 @@ def __handle_sigs(signum, frame):
             CACHE.caught_exception(signum)
         sys.exit(999)
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
+def entrypoint():
     signal.signal(signal.SIGTERM, __handle_sigs)
     signal.signal(signal.SIGINT, __handle_sigs)
     try:
@@ -1591,6 +1642,7 @@ if __name__ == "__main__":
         DYING = True
         LOGGER.error(f"Caught exception: {e}, Exiting... Please wait for cleanup to finish.")
         LOGGER.debug(traceback.format_exc())
+        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
         if len(PIDS) > 0:
             for pid in PIDS:
                 LOGGER.error(f"Killing pid {pid}")

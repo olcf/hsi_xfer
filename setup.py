@@ -17,7 +17,7 @@ setup(name='hsi_xfer',
       packages=find_packages(),
       entry_points={
           'console_scripts': [
-              'hsi_xfer = hsi_xfer.__main__:main'
+              'hsi_xfer = hsi_xfer.__main__:entrypoint'
           ]
       },
       cmdclass={'install': CustomInstall},

@@ -11,7 +11,7 @@ if [[ "${1:-x}" == "prod" ]] ; then
 	python3 ./setup.py install --install-scripts ${PROD_DEST}/bin/hsi_xfer
 else
 	rm -rf ${DEV_DEST}
-	conda create -y -p ${DEV_DEST} python=3.9
+	conda create -y -p ${DEV_DEST} python=3.12
 	source activate ${DEV_DEST}
 	conda activate ${DEV_DEST}
 	pip3 install -r requirements.txt
