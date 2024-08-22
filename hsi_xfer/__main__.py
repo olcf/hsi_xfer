@@ -4,6 +4,7 @@
 
 import argparse
 import getpass
+import socket
 import logging.handlers
 import traceback
 import json
@@ -39,6 +40,7 @@ from typing import Optional
 
 
 LOGGER = None
+LOCKFILE = None
 PROFILER = None
 DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
 CACHE = None
@@ -89,6 +91,68 @@ PIDS = []
 #
 # =============================================================================
 
+class LockFile():
+    def __init__(self, path):
+        self.path = path
+        self.pid = os.getpid()
+        self.hostname = socket.getfqdn()
+        self.start = int(time.time())
+        # create lockffile if it doesn't exist
+        if not os.path.exists(path):
+            self.create_lockfile()
+
+    def __del__(self):
+        self.cleanup()
+
+    def cleanup(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def pid_exists(self, pid):        
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        else:
+            return True
+
+    def create_lockfile(self):
+        payload = {
+                'start': self.start,
+                'pid': self.pid,
+                'hostname': self.hostname,
+        }
+        try:
+            with open(self.path, 'w') as lf:
+                lf.write(json.dumps(payload))
+            LOGGER.info(f"Created lockfile: {self.path}")
+        except Exception as e:
+            LOGGER.error('Error creating lockfile. Can not find user home directory?')
+            LOGGER.debug(e)
+            cleanup_and_die(998)
+
+    def check_lockfile_valid(self):
+        lfdata = None
+        with open(self.path, 'r') as lf:
+            lfdata = json.load(lf)
+        # If lockfile expired: remove it and create a new one
+        if (self.start - lfdata['start'] >=259200):
+            os.remove(self.path)
+            self.create_lockfile()
+            return 
+
+        if (self.pid != lfdata['pid']):
+            # If the pid exists, and the hostname is the same, assume theres another proc running and die
+            if self.pid_exists(lfdata['pid']) and (self.hostname == lfdata['hostname']):
+                self.fail()
+        # If the hostnames don't match, then just die b/c we can't assume that the pid exists or not there
+        if (self.hostname != lfdata['hostname']):
+            self.fail()
+
+    def fail(self):
+        LOGGER.error('Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!')
+        LOGGER.error('Only one hsi_xfer process can be run at a time by any given user')
+        cleanup_and_die(997)
 
 class CustomFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
@@ -232,7 +296,7 @@ class Cache:
             shutil.move(self.filelists_root_path, self.cache_parent_path)
         self.pack()
 
-    def caught_exception(self, e):
+    def caught_exception(self):
         self.cleanup_filelists = False
         self.cleanup_db = False
         # We call cleanup() here just in case we get a weird exception, we catch that exception and leave the cache in a state
@@ -247,17 +311,24 @@ class Cache:
         LOGGER.debug("Packing up cache files into tarball")
         with tarfile.open(f"{self.archive_path}.tar.gz", "w:gz") as t:
             t.add(self.archive_path, arcname=os.path.basename(self.archive_path))
-            time.sleep(1)
-
-        try:
-            shutil.rmtree(self.archive_path)
-        except:
             time.sleep(5)
+
+        failed = None
+        for i in range(0,5):
             try:
                 shutil.rmtree(self.archive_path)
-            except Exception as e:
-                LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
-                sys.exit(888)
+            except:
+                time.sleep(1)
+                try:
+                    shutil.rmtree(self.archive_path)
+                except Exception as e:
+                    failed = e
+            if failed is None:
+                break
+            failed = None
+        if failed is not None:
+            LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
+            LOGGER.error(f"{e}")
 
         LOGGER.info(f"Saved cache at {self.archive_path}.tar.gz")
 
@@ -311,7 +382,7 @@ class Database:
             LOGGER.critical(
                     "Can not open %s. Database may be corrupt: %s", self.dbpath, e
             )
-            sys.exit(3)
+            cleanup_and_die(3)
 
         metadata = sqlalchemy.MetaData()
         self.vvs_tbl = sqlalchemy.Table('vvs', metadata, autoload_with=self.engine)
@@ -353,7 +424,6 @@ class Database:
         with Session(bind=self.engine) as s:
             stmt = select(func.sum(Files.sizebytes)).select_from(Files).where(Files.transfer_status == TransferStatus.completed.value)
             row = s.execute(stmt).fetchall()[0][0]
-            LOGGER.debug(row)
             if row is not None:
                 return row
             else:
@@ -385,7 +455,7 @@ class Database:
             except Exception as e:
                 if not DYING:
                     LOGGER.error("Could not update state information in the cache!")
-                    sys.exit(999)
+                    cleanup_and_die(30)
                 else:
                     LOGGER.debug("Encountered the following exception while dying:")
                     LOGGER.debug(f"{e}")
@@ -407,7 +477,7 @@ class Database:
                         LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath} DYING={DYING}")
                         LOGGER.debug("(insertdesttree)")
                         LOGGER.debug(f"{e}")
-                        sys.exit(111)
+                        cleanup_and_die(111)
     
 
     # Insert file entries into the files table
@@ -429,12 +499,12 @@ class Database:
                 vvid = self.vvExists(vv) 
                 if vvid is None:
                     LOGGER.fatal("Insert of VV failed!")
-                    sys.exit(100)
+                    cleanup_and_die(100)
 
             destid = self.getdest(dest)[0] # This can do a select for each file
             if destid == []:
                 LOGGER.critical("No destination found; Cowardly failing...")
-                sys.exit(2)
+                cleanup_and_die(2)
 
             size = file[2]
 
@@ -453,7 +523,7 @@ class Database:
                     LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}")
                     LOGGER.debug("(insertfiles)")
                     LOGGER.debug(f"{e}")
-                    sys.exit(111)
+                    cleanup_and_die(222)
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
@@ -499,7 +569,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(333)
 
     # Mark a destination driectory as created
     def markdestcreated(self, destid):
@@ -511,7 +581,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(444)
 
 
     # Marks a file as 'staging' this is more or less equiv to 'transferring'
@@ -524,7 +594,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(555)
 
     # Set the value of the hpss-derived checksum for the file object
     def setsrcchecksum(self, srcpath, checksum):
@@ -536,7 +606,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(666)
 
     # Sets the value of the md5sum performed at the destination
     def setdestchecksum(self, fileid, checksum):
@@ -548,7 +618,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(777)
 
     # Marks the checksum status of a file as completed
     def markfilechecksumascomplete(self, fileid):
@@ -560,7 +630,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(888)
 
     # Marks the checksum status of a file as failed
     def markfilechecksumasfailed(self, fileid):
@@ -572,7 +642,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(112)
 
 
     # Marks the file trasfer as completed
@@ -586,7 +656,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(113)
 
     # Marks the file as hpss_checksum_complete
     def markfileashpsschecksumcomplete(self, srcpath):
@@ -598,7 +668,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(114)
 
     # Inserts a VV into the vvs table
     def insertvv(self, vv):
@@ -616,7 +686,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(115)
 
     # Retrieve a vv entry by name
     def getvv(self, vv):
@@ -685,7 +755,7 @@ class Database:
                     LOGGER.debug(f"{e}")
                     if not DYING:
                         LOGGER.critical("Could not read from database. Exiting. rc=112")
-                        sys.exit(112)
+                        cleanup_and_die(116)
         return row if row is not None else []
 
     # Get files marked as 'destination file exists'
@@ -754,7 +824,7 @@ class Database:
         except Exception as e:
             LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
             LOGGER.debug(f"{e}")
-            sys.exit(111)
+            cleanup_and_die(117)
 
 
 # Object to manage the HSIJobs required for migration of files in the DB
@@ -822,7 +892,7 @@ class MigrateJob:
                 LOGGER.critical(
                     "ERROR: Could not create destination directory (%s).\n(%s)", path.path, e
                 )
-                sys.exit(3)
+                cleanup_and_die(118)
             else:
                 DATABASE.markdestcreated(path.id)
 
@@ -871,7 +941,7 @@ class MigrateJob:
                 LOGGER.critical(
                     "vvs-per-job needs to be either -1 or a positive integer!"
                 )
-                sys.exit(4)
+                cleanup_and_die(4)
             if chunksize == -1:
                 yield lst
             for i in range(0, len(lst), chunksize):
@@ -888,7 +958,7 @@ class MigrateJob:
             for lst in chunk(allvvs, int(self.vvs_per_job)):
                 vvs.append(list(lst))
 
-        LOGGER.info("Will generate {len(vvs)} file lists", extra={'block':'cli'})
+        LOGGER.info(f"Will generate {len(vvs)} file lists", extra={'block':'cli'})
 
         # Get list of exisitng files from the db
         existingFiles = DATABASE.getexistingfiles()
@@ -912,14 +982,14 @@ class MigrateJob:
         filelistnum = 0
         filesCompleted = len(existingFiles)
         filesTotal = DATABASE.gettotalnumberoffiles()[0]
-        LOGGER.info("Will transfer {len(vvs)} files from HPSS", extra={'block':'cli'})
+        LOGGER.info(f"Will transfer {filesTotal} files from HPSS", extra={'block':'cli'})
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
         DATABASE.update_state(filelist_count=len(vvs))
-        firstrun = True
+        first_iter = True
 
         for vvlist in vvs:
             files = []
@@ -1003,27 +1073,40 @@ class MigrateJob:
                         self.verbose,
                         "in {}".format(infilename),
                     )
-                    if firstrun:
+                    if first_iter:
                         LOGGER.info(
                             "Launching a sorted batch migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
                         )
-                        firstrun = False
                     if not self.dry_run:
                         for f in files:
                             DATABASE.markfileasstaging(f[2])
                         # Run the job!
                         # Scan through the output looking for errors and md5 sums. Populate the db accordingly
                         last_notif_time = int(time.time())
-                        first_iter = True
+                        last_notif_idx = 0
                         for chunk in migration_job.run(continueOnFailure=True):
                             for line in chunk:
-                                if int(time.time()) - last_notif_time >= 30 or first_iter:
+                                # Log output to the user every 30s or if its the first iteration
+                                now = int(time.time())
+                                if ((now - last_notif_time) >= 60) or (first_iter is True):
                                     first_iter = False
+                                    last_notif_time = now
                                     LOGGER.info(
                                         "%s/%s file transfers have been attempted",
                                         filesCompleted,
                                         filesTotal,
+                                        extra={'block':'syslog'},
                                     )
+                                # Log output to syslog every 10% of total or if its the first iteration
+                                if ((filesCompleted/filesTotal * 100) % 10 == 0 and last_notif_idx != filesCompleted) or (first_iter is True):
+                                    first_iter = False
+                                    last_notif_idx = filesCompleted
+                                    payload = { "filescompleted": filesCompleted, "filestotal": filesTotal }
+                                    LOGGER.info(
+                                        json.dumps(payload),
+                                        extra={'block':'cli'},
+                                    )
+
                                 if "(md5)" in line:
                                     checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
                                     DATABASE.setsrcchecksum(srcpath, checksum)
@@ -1034,7 +1117,6 @@ class MigrateJob:
                                     srcpath = matches.group(2)
                                     filesCompleted += 1
                                     LOGGER.debug("Processed (%s/%s) files: %s", filesCompleted, filesTotal, srcpath)
-                                    LOGGER.info("Processed (%s/%s) files: %s", filesCompleted, filesTotal, srcpath, extra={'block':'cli'})
                                     DATABASE.markfileastransfercompleted(srcpath)
 
                                 if "get: Error" in line:
@@ -1043,9 +1125,16 @@ class MigrateJob:
                                         line.split(" ")[-1],
                                     )
                                     DATABASE.markasfailed(line.split(" ")[-1])
+                        # Log the last notifications
                         LOGGER.info("%s/%s file transfers have been attempted",
                                         filesCompleted,
                                         filesTotal,
+                                        extra={'block':'syslog'},
+                        )
+                        payload = { "filescompleted": filesCompleted, "filestotal": filesTotal }
+                        LOGGER.info(
+                            json.dumps(payload),
+                            extra={'block':'cli'}
                         )
                         PROFILER.snapshot()
                     else:
@@ -1168,7 +1257,7 @@ class MigrateJob:
                         return line.split("\t")[-1]
                     elif "FILE" in line:
                         LOGGER.critical("Invalid source path provided. Single file transfers are not supported! Please replace the source path with a directory")
-                        sys.exit(555)
+                        cleanup_and_die(118)
 
         # Last ditch effort, just basically do _hpss_root_dir on path
         return path
@@ -1214,7 +1303,7 @@ class MigrateJob:
             if DATABASE.gettotalnumberoffiles()[0] == 0:
                 LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.destination}")
                 LOGGER.critical(f"Use --overwrite-existing to overwrite files in the destination directory")
-                sys.exit(6)
+                cleanup_and_die(119)
         else:
             LOGGER.info("Skipping file indexing due to input cache")
         PROFILER.snapshot()
@@ -1348,7 +1437,7 @@ class HSIJob:
             for line in output:
                 LOGGER.debug(line)
             if not continueOnFailure:
-                sys.exit(101)
+                cleanup_and_die(120)
 
         PROFILER.snapshot()
         if len(output) > 0:
@@ -1525,6 +1614,12 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose)
+    
+    global LOCKFILE
+   # LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
+   # # Can we get a lockfile and if not, error and exit
+   # LOCKFILE.check_lockfile_valid()
+
     if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
         LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
         LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
@@ -1605,18 +1700,24 @@ def main():
     with open(reportfilename, "w", encoding="UTF-8") as f:
         json.dump(finalreport, f, indent=2)
     LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
-    LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
+    if not args.dry_run:
+        LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
-    LOGGER.info(f"Total size in bytes: {finalreport['total_size_in_bytes']}", extra={'block':'cli'})
-    LOGGER.info(f"Elapsed time: {finalreport['elapsed_time']}s", extra={'block':'cli'})
-    LOGGER.info(f"Successful files: {len(finalreport['successful_transfers'])}", extra={'block':'cli'})
-    LOGGER.info(f"Failed files: {len(finalreport['failed_transfers'])}", extra={'block':'cli'})
-    LOGGER.info(f"Failed to checksum files: {len(finalreport['failed_to_checksum'])}", extra={'block':'cli'})
-    LOGGER.info(f"Existing files skipped: {len(finalreport['existing_files_skipped'])}", extra={'block':'cli'})
+        syslogpayload = {
+                'total_size_in_bytes': finalreport['total_size_in_bytes'],
+                'elapsed_time': finalreport['elapsed_time'],
+                'num_successful_files': len(finalreport['successful_transfers']),
+                'num_failed_files': len(finalreport['failed_transfers']),
+                'num_files_failed_to_checksum': len(finalreport['failed_to_checksum']),
+                'num_files_skipped': len(finalreport['existing_files_skipped']),
+        }
+
+        LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={'block':'cli'})
 
     PROFILER.print_report()
     DATABASE.cleanup()
     CACHE.cleanup()
+   # LOCKFILE.cleanup()
 
 def __handle_sigs(signum, frame):
     global DYING
@@ -1625,16 +1726,21 @@ def __handle_sigs(signum, frame):
         LOGGER.debug(traceback.format_exc())
         LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
         DYING = True
-        if len(PIDS) > 0:
-            for pid in PIDS:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-        if DATABASE is not None:
-            DATABASE.cleanup()
-        if CACHE is not None:
-            CACHE.caught_exception(signum)
-        sys.exit(999)
+        cleanup_and_die(999)
 
-#if __name__ == "__main__":
+def cleanup_and_die(rc):
+    if DATABASE is not None:
+        DATABASE.cleanup()
+    if CACHE is not None:
+        CACHE.caught_exception()
+    if LOCKFILE is not None:
+        LOCKFILE.cleanup()
+    if len(PIDS) > 0:
+        for pid in PIDS:
+            LOGGER.error(f"Killing pid {pid}")
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    sys.exit(rc)
+
 def entrypoint():
     signal.signal(signal.SIGTERM, __handle_sigs)
     signal.signal(signal.SIGINT, __handle_sigs)
@@ -1646,12 +1752,4 @@ def entrypoint():
         LOGGER.error(f"Caught exception: {e}, Exiting... Please wait for cleanup to finish.")
         LOGGER.debug(traceback.format_exc())
         LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
-        if len(PIDS) > 0:
-            for pid in PIDS:
-                LOGGER.error(f"Killing pid {pid}")
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-        if DATABASE is not None:
-            DATABASE.cleanup()
-        if CACHE is not None:
-            CACHE.caught_exception(e)
-        sys.exit(99)
+        cleanup_and_die(99)
