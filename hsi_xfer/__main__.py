@@ -952,11 +952,12 @@ class MigrateJob:
 
         #TODO: This may be a problem, if we use --vvs-per-job > 1
         vvs = list(chunk(allvvs, int(self.vvs_per_job)))
+        LOGGER.debug(f"vvs={vvs}")
         #TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
-        if len(vvs) > len(allvvs):
-            vvs = []
-            for lst in chunk(allvvs, int(self.vvs_per_job)):
-                vvs.append(list(lst))
+        #if len(vvs) > len(allvvs):
+        #    vvs = []
+        #    for lst in chunk(allvvs, int(self.vvs_per_job)):
+        #        vvs.append(list(lst))
 
         LOGGER.info(f"Will generate {len(vvs)} file lists", extra={'block':'cli'})
 
@@ -1587,7 +1588,7 @@ def main():
         type=str,
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
-    parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
+    #parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
     parser.add_argument(
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
     )
