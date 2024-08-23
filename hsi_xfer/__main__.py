@@ -1214,7 +1214,8 @@ class MigrateJob:
             totalsize = DATABASE.gettotalsize()
             starttime = DATABASE.getstarttime()
             endtime = int(time.time())
-            elapsed = (endtime - starttime)
+            # Default to 1 second elapsed here just to prevent divide by zero
+            elapsed = (endtime - starttime) if (endtime-starttime) > 0 else 1
             bps = (totalsize/1000/1000)/elapsed
             report["average_speed"] = bps
             report["elapsed_time"] = elapsed
