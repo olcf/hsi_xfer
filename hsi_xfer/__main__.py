@@ -1623,9 +1623,10 @@ def main():
    # # Can we get a lockfile and if not, error and exit
    # LOCKFILE.check_lockfile_valid()
 
-    if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
+    #if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
+    if args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
         LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
+       # LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --checksum-threads={args.checksum_threads}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --debug={args.debug}", extra={'block':'cli'})
         LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={'block':'cli'})
