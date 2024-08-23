@@ -835,7 +835,8 @@ class MigrateJob:
         self.filelists_path = CACHE.get_unpacked_filelist_root_path()
 
         self.disable_checksums = args.disable_checksums
-        self.vvs_per_job = args.vvs_per_job
+        #self.vvs_per_job = args.vvs_per_job
+        self.vvs_per_job = 1
         self.addl_flags = args.additional_hsi_flags
         self.overwrite = args.overwrite_existing
         self.disable_ta = args.disable_ta
