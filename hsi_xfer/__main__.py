@@ -151,7 +151,7 @@ class LockFile():
 
     def fail(self):
         LOGGER.error('Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!')
-        LOGGER.error('Only one hsi_xfer process can be run at a time by any given user')
+        LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
         cleanup_and_die(997)
 
 class CustomFormatter(logging.Formatter):
@@ -1619,9 +1619,9 @@ def main():
     initLogger(args.verbose)
     
     global LOCKFILE
-   # LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
+    LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
    # # Can we get a lockfile and if not, error and exit
-   # LOCKFILE.check_lockfile_valid()
+    LOCKFILE.check_lockfile_valid()
 
     #if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
     if args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
@@ -1721,7 +1721,7 @@ def main():
     PROFILER.print_report()
     DATABASE.cleanup()
     CACHE.cleanup()
-   # LOCKFILE.cleanup()
+    LOCKFILE.cleanup()
 
 def __handle_sigs(signum, frame):
     global DYING
@@ -1733,6 +1733,8 @@ def __handle_sigs(signum, frame):
         cleanup_and_die(999)
 
 def cleanup_and_die(rc):
+    if rc != 0:
+        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
     if DATABASE is not None:
         DATABASE.cleanup()
     if CACHE is not None:
