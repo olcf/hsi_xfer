@@ -98,6 +98,7 @@ class LockFile():
         self.hostname = socket.getfqdn()
         self.start = int(time.time())
         # create lockffile if it doesn't exist
+        #TODO: We may need to sit and retry here?
         if not os.path.exists(path):
             self.create_lockfile()
 
@@ -133,8 +134,17 @@ class LockFile():
 
     def check_lockfile_valid(self):
         lfdata = None
-        with open(self.path, 'r') as lf:
-            lfdata = json.load(lf)
+        # Check to see if the file exists: it should be created by this point. If not wait...
+        if not os.path.exists(self.path):
+            time.sleep(5)
+        try:
+            with open(self.path, 'r') as lf:
+                lfdata = json.load(lf)
+        except Exception as e:
+            LOGGER.error(f"Could not create and open lockfile! Can not find user home directory?")
+            LOGGER.debug(e)
+            cleanup_and_die(996)
+
         # If lockfile expired: remove it and create a new one
         if (self.start - lfdata['start'] >=259200):
             os.remove(self.path)
