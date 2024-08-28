@@ -125,7 +125,7 @@ class LockFile():
         try:
             with open(self.path, 'w') as lf:
                 lf.write(json.dumps(payload))
-            LOGGER.info(f"Created lockfile: {self.path}")
+            LOGGER.debug(f"Created lockfile: {self.path}")
         except Exception as e:
             LOGGER.error('Error creating lockfile. Can not find user home directory?')
             LOGGER.debug(e)
@@ -152,7 +152,7 @@ class LockFile():
     def fail(self):
         LOGGER.error('Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!')
         LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
-        cleanup_and_die(997)
+        cleanup_and_die(997, delete_lockfile=False)
 
 class CustomFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
@@ -1732,14 +1732,14 @@ def __handle_sigs(signum, frame):
         DYING = True
         cleanup_and_die(999)
 
-def cleanup_and_die(rc):
+def cleanup_and_die(rc, delete_lockfile=True):
     if rc != 0:
         LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
     if DATABASE is not None:
         DATABASE.cleanup()
     if CACHE is not None:
         CACHE.caught_exception()
-    if LOCKFILE is not None:
+    if LOCKFILE is not None and delete_lockfile is True:
         LOCKFILE.cleanup()
     if len(PIDS) > 0:
         for pid in PIDS:
