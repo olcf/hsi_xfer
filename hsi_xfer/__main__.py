@@ -39,6 +39,7 @@ from typing import List
 from typing import Optional
 
 
+FILE_RETRY_LIMIT = 3
 LOGGER = None
 LOCKFILE = None
 PROFILER = None
@@ -107,7 +108,13 @@ class LockFile():
 
     def cleanup(self):
         if os.path.exists(self.path):
-            os.remove(self.path)
+            lfdata = None
+            with open(self.path, 'r') as lf:
+                lfdata = json.load(lf)
+            if lfdata["pid"] == self.pid:
+                os.remove(self.path)
+            else:
+                LOGGER.debug("Not removing lockfile since PIDs do not match")
 
     def pid_exists(self, pid):        
         try:
@@ -126,6 +133,17 @@ class LockFile():
         try:
             with open(self.path, 'w') as lf:
                 lf.write(json.dumps(payload))
+            #try 3 times to see if the lockfile got written. If not, then we should die here
+            exists = False
+            for i in range(0,FILE_RETRY_LIMIT): 
+                if not os.path.exists(self.path):
+                    time.sleep(5)
+                else:
+                    exists = True
+                    break
+            if exists is False:
+                LOGGER.error("Could not write lockfile! Please try again.")
+                cleanup_and_die(995)
             LOGGER.debug(f"Created lockfile: {self.path}")
         except Exception as e:
             LOGGER.error('Error creating lockfile. Can not find user home directory?')
@@ -135,13 +153,11 @@ class LockFile():
     def check_lockfile_valid(self):
         lfdata = None
         # Check to see if the file exists: it should be created by this point. If not wait...
-        if not os.path.exists(self.path):
-            time.sleep(5)
         try:
             with open(self.path, 'r') as lf:
                 lfdata = json.load(lf)
         except Exception as e:
-            LOGGER.error(f"Could not create and open lockfile! Can not find user home directory?")
+            LOGGER.error(f"Could not read lockfile after writing! Try again, or contact User Assistance")
             LOGGER.debug(e)
             cleanup_and_die(996)
 
@@ -152,9 +168,17 @@ class LockFile():
             return 
 
         if (self.pid != lfdata['pid']):
-            # If the pid exists, and the hostname is the same, assume theres another proc running and die
-            if self.pid_exists(lfdata['pid']) and (self.hostname == lfdata['hostname']):
+            # if the lockfile exists and pids are different, and:
+            # * the pid does not exist and the hostname is the same: assume defunct lockfile and replace
+            # * the pid does not exist and the hostname is different: fail
+            # * the pid does exist and the hostname is different: fail
+            # * the pid does exist and the hostname is the same: fail
+            if (not self.pid_exists(lfdata['pid'])) and (self.hostname == lfdata['hostname']):
+                os.remove(self.path)
+                self.create_lockfile()
+            else:
                 self.fail()
+            
         # If the hostnames don't match, then just die b/c we can't assume that the pid exists or not there
         if (self.hostname != lfdata['hostname']):
             self.fail()
@@ -1749,12 +1773,16 @@ def cleanup_and_die(rc, delete_lockfile=True):
         DATABASE.cleanup()
     if CACHE is not None:
         CACHE.caught_exception()
-    if LOCKFILE is not None and delete_lockfile is True:
-        LOCKFILE.cleanup()
     if len(PIDS) > 0:
         for pid in PIDS:
             LOGGER.error(f"Killing pid {pid}")
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception as e:
+                LOGGER.error(f"Could not kill PID {pid}. Please ensure this process has been killed before restarting!")
+                LOGGER.debug(e)
+    if LOCKFILE is not None and delete_lockfile is True:
+        LOCKFILE.cleanup()
     sys.exit(rc)
 
 def entrypoint():
