@@ -44,7 +44,7 @@ FILE_RETRY_LIMIT = 3
 LOGGER = None
 LOCKFILE = None
 PROFILER = None
-DB_TX_SIZE = None # This gets set by the -s flag; defaults to 9000
+DB_TX_SIZE = None  # This gets set by the -s flag; defaults to 9000
 CACHE = None
 DATABASE = None
 SCHEMA_VERSION = 4
@@ -93,7 +93,8 @@ PIDS = []
 #
 # =============================================================================
 
-class LockFile():
+
+class LockFile:
     def __init__(self, path):
         self.path = path
         self.lockfile = None
@@ -118,12 +119,17 @@ class LockFile():
                 os.remove(self.path)
 
     def cleanup(self):
-         self.unlock()
+        self.unlock()
 
     def fail(self, delete_lockfile=True):
-        LOGGER.error('Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!')
-        LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
+        LOGGER.error(
+            "Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!"
+        )
+        LOGGER.error(
+            "To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user"
+        )
         cleanup_and_die(997, delete_lockfile=delete_lockfile)
+
 
 class CustomFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
@@ -138,13 +144,12 @@ class CustomFormatter(logging.Formatter):
     formaterror = "\r[-] %(message)s"
     formatwarning = "\r[-] %(message)s"
 
-
     FORMATS = {
         logging.DEBUG: grey + formatdebug + reset,
         logging.INFO: green + formatinfo + reset,
         logging.WARNING: yellow + formatwarning + reset,
         logging.ERROR: red + formaterror + reset,
-        logging.CRITICAL: bold_red + formatcritical + reset
+        logging.CRITICAL: bold_red + formatcritical + reset,
     }
 
     def format(self, record):
@@ -167,17 +172,20 @@ class TransferStatus(Enum):
     failed = 11
     skipped = 12
 
+
 class Base(DeclarativeBase):
     pass
 
+
 class VV(Base):
-    __tablename__ = 'vvs'
+    __tablename__ = "vvs"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str]
     is_tape: Mapped[bool]
 
+
 class State(Base):
-    __tablename__ = 'state'
+    __tablename__ = "state"
     id: Mapped[int] = mapped_column(primary_key=True)
     schema_version: Mapped[int]
     indexing_complete: Mapped[bool]
@@ -186,13 +194,14 @@ class State(Base):
 
 
 class DestTree(Base):
-    __tablename__ = 'desttree'
+    __tablename__ = "desttree"
     id: Mapped[int] = mapped_column(primary_key=True)
     path: Mapped[str]
     created: Mapped[bool]
 
+
 class Files(Base):
-    __tablename__ = 'files'
+    __tablename__ = "files"
     id: Mapped[int] = mapped_column(primary_key=True)
     path: Mapped[str] = mapped_column(sqlite_on_conflict_unique="IGNORE", unique=True)
     src_checksum: Mapped[str] = mapped_column(nullable=True)
@@ -205,50 +214,65 @@ class Files(Base):
     destfileexists: Mapped[bool]
     sizebytes: Mapped[int]
 
+
 #
 # Meta-class to track database and filelists created and to package them into an archive in case of interruption
 #
 class Cache:
-    def __init__(self, verbose, cache_parent_path, cleanup_filelists=False, cleanup_db=False, existing_path=None, debug=False):
-        self.verbose = verbose 
+    def __init__(
+        self,
+        verbose,
+        cache_parent_path,
+        cleanup_filelists=False,
+        cleanup_db=False,
+        existing_path=None,
+        debug=False,
+    ):
+        self.verbose = verbose
         # Will either be --preserved-files-path or os.getcwd()
         self.cache_parent_path = cache_parent_path
         self.cleanup_filelists = cleanup_filelists
         self.cleanup_db = cleanup_db
-        self.existing_path = None if existing_path is None else os.path.abspath(existing_path)
+        self.existing_path = (
+            None if existing_path is None else os.path.abspath(existing_path)
+        )
         self.debug = debug
         self.original_archive = None
 
         self.filelists = []
 
         # Cache does not exist
-        if self.existing_path is None or (self.existing_path is not None and not os.path.exists(self.existing_path)):
-            if (self.existing_path is not None and not os.path.exists(self.existing_path)):
-                LOGGER.info(f"Cache file does not exist: {self.existing_path}. Creating new cache file")
+        if self.existing_path is None or (
+            self.existing_path is not None and not os.path.exists(self.existing_path)
+        ):
+            if self.existing_path is not None and not os.path.exists(
+                self.existing_path
+            ):
+                LOGGER.info(
+                    f"Cache file does not exist: {self.existing_path}. Creating new cache file"
+                )
                 self.existing_path = None
             self.archive_path = os.path.join(
                 self.cache_parent_path, f"hsi_xfer_{int(time.time())}.cache"
             )
-            self.cache_path = os.path.join(
-                self.archive_path, "cache"
-            )
+            self.cache_path = os.path.join(self.archive_path, "cache")
             self.dbpath = os.path.join(self.cache_path, "database.db")
             self.filelists_root_path = os.path.join(self.cache_path, "filelists")
             if os.path.exists(self.dbpath):
                 # If we get here something weird went wrong! Like a user trying to run 2 within the same second
-                LOGGER.error('Error locking process! Ensure there is only one hsi_xfer process running, and that any hsi_xfer*.cache directories are cleaned up')
-                LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
+                LOGGER.error(
+                    "Error locking process! Ensure there is only one hsi_xfer process running, and that any hsi_xfer*.cache directories are cleaned up"
+                )
+                LOGGER.error(
+                    "To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user"
+                )
                 cleanup_and_die(201)
         else:
             # Cache exists; resuming
             self.archive_path = self.existing_path
             self.unpack()
-            self.cache_path = os.path.join(
-                    self.archive_path, "cache"
-            )
-            self.dbpath = os.path.join(
-                self.cache_path, "database.db"
-            )
+            self.cache_path = os.path.join(self.archive_path, "cache")
+            self.dbpath = os.path.join(self.cache_path, "database.db")
             self.filelists_root_path = os.path.join(self.cache_path, "filelists")
 
         # If the directory that the cache will be written to doesn't exist, go ahead and mkdir it
@@ -258,8 +282,8 @@ class Cache:
         # If the cache_path doesn't exist, go ahead and mkdir it
         if not os.path.exists(self.archive_path):
             os.makedirs(self.archive_path)  # hpss_...cache
-            os.makedirs(self.cache_path) # hpss_..._.cache/cache
-            os.makedirs(self.filelists_root_path) # hpss_...cache/cache/filelists
+            os.makedirs(self.cache_path)  # hpss_..._.cache/cache
+            os.makedirs(self.filelists_root_path)  # hpss_...cache/cache/filelists
 
     def cleanup(self):
         if self.cleanup_filelists and self.cleanup_db:
@@ -290,7 +314,7 @@ class Cache:
             time.sleep(5)
 
         failed = None
-        for i in range(0,5):
+        for i in range(0, 5):
             try:
                 shutil.rmtree(self.archive_path)
             except:
@@ -303,23 +327,31 @@ class Cache:
                 break
             failed = None
         if failed is not None:
-            LOGGER.error(f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}")
+            LOGGER.error(
+                f"Could not remove the unpacked cache! Cache has been saved to {self.archive_path}.tar.gz; Please remove the existing cachedir before trying again: {self.archive_path}"
+            )
             LOGGER.error(f"{e}")
 
         LOGGER.info(f"Saved cache at {self.archive_path}.tar.gz")
 
     def unpack(self):
-        self.original_archive = self.archive_path # Save the path to the input archive.
-        self.archive_path = os.path.abspath(self.archive_path) # Gets the fully qualified path to the tar'd archive
+        self.original_archive = self.archive_path  # Save the path to the input archive.
+        self.archive_path = os.path.abspath(
+            self.archive_path
+        )  # Gets the fully qualified path to the tar'd archive
         # Save original path
-        cache_basename = '.'.join(list(filter(None,os.path.basename(self.archive_path).split(".")[:-2])))
+        cache_basename = ".".join(
+            list(filter(None, os.path.basename(self.archive_path).split(".")[:-2]))
+        )
         # Interpolate the name of the cache
         self.archive_path = os.path.join(self.cache_parent_path, cache_basename)
-        LOGGER.debug(f"Unpacking cache archive: archive_path: {self.archive_path}, cache_parent_path: {self.cache_parent_path}, existing_archive: {self.original_archive}")
+        LOGGER.debug(
+            f"Unpacking cache archive: archive_path: {self.archive_path}, cache_parent_path: {self.cache_parent_path}, existing_archive: {self.original_archive}"
+        )
         # Untar the cache in the --preserved-files-path or cwd
         with tarfile.open(self.original_archive) as t:
             # If theres permissions issues, maybe set filter to either 'tar' or 'fully_trusted'
-            t.extractall(self.cache_parent_path, filter='data')
+            t.extractall(self.cache_parent_path, filter="data")
 
     def get_unpacked_db_path(self):
         return self.dbpath
@@ -336,6 +368,7 @@ class Cache:
     def get_unpacked_report_dir(self):
         return self.cache_parent_path
 
+
 # Object to wrap communications to and from the DB. This also ensures that db
 # communication is locked so that threads don't try
 # and access the db at the same time b/c sqlite
@@ -350,21 +383,23 @@ class Database:
 
         self.dbpath = CACHE.get_unpacked_db_path()
 
-        #Connect to DB
+        # Connect to DB
         try:
             self.engine = create_engine(f"sqlite:///{self.dbpath}", echo=self.debug)
             Base.metadata.create_all(self.engine)
         except Exception as e:  # pylint: disable=bare-except
             LOGGER.critical(
-                    "Can not open %s. Database may be corrupt: %s", self.dbpath, e
+                "Can not open %s. Database may be corrupt: %s", self.dbpath, e
             )
             cleanup_and_die(3)
 
         metadata = sqlalchemy.MetaData()
-        self.vvs_tbl = sqlalchemy.Table('vvs', metadata, autoload_with=self.engine)
-        self.files_tbl = sqlalchemy.Table('files', metadata, autoload_with=self.engine)
-        self.desttree_tbl = sqlalchemy.Table('desttree', metadata, autoload_with=self.engine)
-        self.state_tbl = sqlalchemy.Table('state', metadata, autoload_with=self.engine)
+        self.vvs_tbl = sqlalchemy.Table("vvs", metadata, autoload_with=self.engine)
+        self.files_tbl = sqlalchemy.Table("files", metadata, autoload_with=self.engine)
+        self.desttree_tbl = sqlalchemy.Table(
+            "desttree", metadata, autoload_with=self.engine
+        )
+        self.state_tbl = sqlalchemy.Table("state", metadata, autoload_with=self.engine)
         self.init_state_tbl()
 
     def cleanup(self):
@@ -379,15 +414,28 @@ class Database:
         indexing_complete = False
         filelist_count = 0
         starttime = self.starttime
-        LOGGER.debug(f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}, starttime={starttime}")
-        row = State(schema_version=schema_version, indexing_complete=indexing_complete, filelist_count=filelist_count, starttime=starttime)
+        LOGGER.debug(
+            f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}, starttime={starttime}"
+        )
+        row = State(
+            schema_version=schema_version,
+            indexing_complete=indexing_complete,
+            filelist_count=filelist_count,
+            starttime=starttime,
+        )
         with Session(bind=self.engine) as s:
-            cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()
+            cur = s.execute(
+                select(State).select_from(State).order_by(State.id.desc()).limit(1)
+            ).fetchall()
             if len(cur) > 0:
                 cur = cur[0][0]
-                LOGGER.debug(f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}, starttime={starttime}")
+                LOGGER.debug(
+                    f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}, starttime={starttime}"
+                )
                 if cur.schema_version != schema_version:
-                    LOGGER.error(f"Attempting to use a cache from an old version of this tool. This will probably fail!")
+                    LOGGER.error(
+                        f"Attempting to use a cache from an old version of this tool. This will probably fail!"
+                    )
             s.add(row)
             s.flush()
             s.commit()
@@ -398,7 +446,11 @@ class Database:
 
     def gettotalsize(self) -> int:
         with Session(bind=self.engine) as s:
-            stmt = select(func.sum(Files.sizebytes)).select_from(Files).where(Files.transfer_status == TransferStatus.completed.value)
+            stmt = (
+                select(func.sum(Files.sizebytes))
+                .select_from(Files)
+                .where(Files.transfer_status == TransferStatus.completed.value)
+            )
             row = s.execute(stmt).fetchall()[0][0]
             if row is not None:
                 return row
@@ -408,24 +460,41 @@ class Database:
     def get_state(self):
         cur = None
         with Session(bind=self.engine) as s:
-            cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()[0][0]
-            all_entries = s.execute(select(State).select_from(State).order_by(State.id.desc())).fetchall()
+            cur = s.execute(
+                select(State).select_from(State).order_by(State.id.desc()).limit(1)
+            ).fetchall()[0][0]
+            all_entries = s.execute(
+                select(State).select_from(State).order_by(State.id.desc())
+            ).fetchall()
             for row in all_entries:
                 if row[0].indexing_complete:
                     cur.indexing_complete = row[0].indexing_complete
         return cur
 
-
-    def update_state(self, schema_version=SCHEMA_VERSION, indexing_complete=False, filelist_count=0):
-        LOGGER.debug(f"Updating state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}")
+    def update_state(
+        self, schema_version=SCHEMA_VERSION, indexing_complete=False, filelist_count=0
+    ):
+        LOGGER.debug(
+            f"Updating state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}"
+        )
         with Session(bind=self.engine) as s:
             try:
-                cur = s.execute(select(State).select_from(State).order_by(State.id.desc()).limit(1)).fetchall()[0][0]
+                cur = s.execute(
+                    select(State).select_from(State).order_by(State.id.desc()).limit(1)
+                ).fetchall()[0][0]
                 if indexing_complete:
                     cur.indexing_complete = indexing_complete
                 if filelist_count > 0:
                     cur.filelist_count = filelist_count
-                s.execute(update(State).where(State.id == cur.id).values(schema_version=cur.schema_version, indexing_complete=cur.indexing_complete, filelist_count=cur.filelist_count))
+                s.execute(
+                    update(State)
+                    .where(State.id == cur.id)
+                    .values(
+                        schema_version=cur.schema_version,
+                        indexing_complete=cur.indexing_complete,
+                        filelist_count=cur.filelist_count,
+                    )
+                )
                 s.flush()
                 s.commit()
             except Exception as e:
@@ -436,10 +505,11 @@ class Database:
                     LOGGER.debug("Encountered the following exception while dying:")
                     LOGGER.debug(f"{e}")
 
-
     # Populate the desttree table. Maps files to destination paths
     def insertdesttree(self, tree):
-        LOGGER.debug(f"Batch inserting destination tree into 'desttree' table (num_dirs={len(tree)})...")
+        LOGGER.debug(
+            f"Batch inserting destination tree into 'desttree' table (num_dirs={len(tree)})..."
+        )
         if len(tree) > 0:
             with Session(bind=self.engine) as s:
                 try:
@@ -450,41 +520,59 @@ class Database:
                     s.commit()
                 except Exception as e:
                     if not DYING:
-                        LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath} DYING={DYING}")
+                        LOGGER.error(
+                            f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath} DYING={DYING}"
+                        )
                         LOGGER.debug("(insertdesttree)")
                         LOGGER.debug(f"{e}")
                         cleanup_and_die(111)
-    
 
     # Insert file entries into the files table
     def insertfiles(self, files, srcroot, destroot, qualified_source):
-        LOGGER.debug(f"Batch inserting files into 'files' table (num_files={len(files)})...")
+        LOGGER.debug(
+            f"Batch inserting files into 'files' table (num_files={len(files)})..."
+        )
 
         files_to_insert = []
         for file in files[:]:
-            vv = file[1].split(',')[0]
+            vv = file[1].split(",")[0]
             fpath = file[0].replace(srcroot, qualified_source, 1)
             if len(vv) != 8:
-                LOGGER.debug(f"No VV found for file {fpath}; skipping and will not track!")
-                LOGGER.error(f"Could not read HPSS metadata for file {fpath}; skipping...")
+                LOGGER.debug(
+                    f"No VV found for file {fpath}; skipping and will not track!"
+                )
+                LOGGER.error(
+                    f"Could not read HPSS metadata for file {fpath}; skipping..."
+                )
                 continue
-            vvid = self.vvExists(vv) 
+            vvid = self.vvExists(vv)
             dest = fpath.replace(qualified_source, destroot, 1)
             if vvid is None:
                 self.insertvv(vv)
-                vvid = self.vvExists(vv) 
+                vvid = self.vvExists(vv)
                 if vvid is None:
                     LOGGER.error("Insert of VV failed!")
                     cleanup_and_die(100)
 
-            destid = self.getdest(dest)[0] # This can do a select for each file
+            destid = self.getdest(dest)[0]  # This can do a select for each file
             if destid == []:
                 LOGGER.critical("No destination found; Cowardly failing...")
                 cleanup_and_die(2)
 
             size = file[2]
 
-            files_to_insert.append(Files(path=fpath, vv=vvid, dest=dest, destdir=destid, checksum_status=ChecksumStatus.not_attempted.value, transfer_status=TransferStatus.not_started.value, destfileexists=False, sizebytes=size))
+            files_to_insert.append(
+                Files(
+                    path=fpath,
+                    vv=vvid,
+                    dest=dest,
+                    destdir=destid,
+                    checksum_status=ChecksumStatus.not_attempted.value,
+                    transfer_status=TransferStatus.not_started.value,
+                    destfileexists=False,
+                    sizebytes=size,
+                )
+            )
 
             files.remove(file)
 
@@ -496,14 +584,21 @@ class Database:
                 s.commit()
             except Exception as e:
                 if not DYING:
-                    LOGGER.error(f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}")
+                    LOGGER.error(
+                        f"Could not commit to cache DB or process killed during COMMIT: {self.dbpath}"
+                    )
                     LOGGER.debug("(insertfiles)")
                     LOGGER.debug(f"{e}")
                     cleanup_and_die(222)
 
     # Returns all files where the transfer is complete, and the source checksum did not fail
     def getnonfailedsrcchecksumfiles(self):
-        stmt = select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.checksum_status != ChecksumStatus.failed.value).where(Files.transfer_status == TransferStatus.completed.value)
+        stmt = (
+            select(Files.path, Files.dest, Files.id)
+            .select_from(Files)
+            .where(Files.checksum_status != ChecksumStatus.failed.value)
+            .where(Files.transfer_status == TransferStatus.completed.value)
+        )
 
         rows = []
         with Session(self.engine) as s:
@@ -513,7 +608,11 @@ class Database:
 
     # returns all files that failed transfers
     def getfailedtransfers(self):
-        stmt = select(Files.path, Files.dest).select_from(Files).where(Files.transfer_status == TransferStatus.failed.value)
+        stmt = (
+            select(Files.path, Files.dest)
+            .select_from(Files)
+            .where(Files.transfer_status == TransferStatus.failed.value)
+        )
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
@@ -521,7 +620,11 @@ class Database:
 
     # Gets all files that failed checksumming
     def getfailedchecksums(self):
-        stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.failed.value)
+        stmt = (
+            select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum)
+            .select_from(Files)
+            .where(Files.checksum_status == ChecksumStatus.failed.value)
+        )
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
@@ -529,7 +632,12 @@ class Database:
 
     # Get all files that successfully finished transferrring and checksumming
     def getsuccessfultransfers(self):
-        stmt = select(Files.path, Files.dest, Files.dest_checksum).select_from(Files).where(Files.checksum_status == ChecksumStatus.completed.value).where(Files.transfer_status == TransferStatus.completed.value)
+        stmt = (
+            select(Files.path, Files.dest, Files.dest_checksum)
+            .select_from(Files)
+            .where(Files.checksum_status == ChecksumStatus.completed.value)
+            .where(Files.transfer_status == TransferStatus.completed.value)
+        )
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(stmt).fetchall()
@@ -537,13 +645,19 @@ class Database:
 
     # Mark a file entry as failed to transfer
     def markasfailed(self, srcpath):
-        stmt = update(Files).where(Files.path == srcpath).values(transfer_status=TransferStatus.failed.value)
+        stmt = (
+            update(Files)
+            .where(Files.path == srcpath)
+            .values(transfer_status=TransferStatus.failed.value)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(333)
 
@@ -555,20 +669,27 @@ class Database:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(444)
 
-
     # Marks a file as 'staging' this is more or less equiv to 'transferring'
     def markfileasstaging(self, fileid):
-        stmt = update(Files).values(transfer_status=TransferStatus.staging.value).where(Files.id == fileid)
+        stmt = (
+            update(Files)
+            .values(transfer_status=TransferStatus.staging.value)
+            .where(Files.id == fileid)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(555)
 
@@ -580,7 +701,9 @@ class Database:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(666)
 
@@ -592,57 +715,82 @@ class Database:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(777)
 
     # Marks the checksum status of a file as completed
     def markfilechecksumascomplete(self, fileid):
-        stmt = update(Files).values(checksum_status=ChecksumStatus.completed.value).where(Files.id == fileid)
+        stmt = (
+            update(Files)
+            .values(checksum_status=ChecksumStatus.completed.value)
+            .where(Files.id == fileid)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(888)
 
     # Marks the checksum status of a file as failed
     def markfilechecksumasfailed(self, fileid):
-        stmt = update(Files).values(checksum_status=ChecksumStatus.failed.value).where(Files.id == fileid)
+        stmt = (
+            update(Files)
+            .values(checksum_status=ChecksumStatus.failed.value)
+            .where(Files.id == fileid)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(112)
-
 
     # Marks the file trasfer as completed
     def markfileastransfercompleted(self, srcpath):
         LOGGER.debug(f"Marking complete: {srcpath}={TransferStatus.completed.value}")
-        stmt = update(Files).values(transfer_status=TransferStatus.completed.value).where(Files.path == srcpath)
+        stmt = (
+            update(Files)
+            .values(transfer_status=TransferStatus.completed.value)
+            .where(Files.path == srcpath)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(113)
 
     # Marks the file as hpss_checksum_complete
     def markfileashpsschecksumcomplete(self, srcpath):
-        stmt = update(Files).values(checksum_status=ChecksumStatus.hpss_complete.value).where(Files.path == srcpath)
+        stmt = (
+            update(Files)
+            .values(checksum_status=ChecksumStatus.hpss_complete.value)
+            .where(Files.path == srcpath)
+        )
         try:
             with Session(self.engine) as s:
                 s.execute(stmt)
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(114)
 
@@ -660,7 +808,9 @@ class Database:
                 s.commit()
 
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(115)
 
@@ -669,31 +819,37 @@ class Database:
         row = None
         with Session(self.engine) as s:
             row = s.execute(
-                    select(VV.id, VV.name).select_from(VV).where(VV.name==vv)
+                select(VV.id, VV.name).select_from(VV).where(VV.name == vv)
             ).one_or_none()
-        return row 
+        return row
 
     def desttreeexists(self, path):
         if path in self.desttrees:
-            return True 
+            return True
         return False
 
     # Get a destination driectory entry by path
     def getdest(self, path):
         dirname = os.path.dirname(path)
         if dirname in self.desttrees:
-            return [ self.desttrees[dirname] ]
+            return [self.desttrees[dirname]]
         else:
             row = None
             with Session(self.engine) as s:
                 row = s.execute(
-                        select(DestTree.id, DestTree.path).select_from(DestTree).where(DestTree.path == dirname)
+                    select(DestTree.id, DestTree.path)
+                    .select_from(DestTree)
+                    .where(DestTree.path == dirname)
                 ).first()
             return row if row is not None else []
 
     # Get file entries where the source and dest checksums do not match
     def getnonmatchingchecksums(self):
-        stmt = select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum).select_from(Files).where(Files.dest_checksum != Files.src_checksum)
+        stmt = (
+            select(Files.path, Files.src_checksum, Files.dest, Files.dest_checksum)
+            .select_from(Files)
+            .where(Files.dest_checksum != Files.src_checksum)
+        )
 
         rows = []
         if self.disable_checksums:
@@ -717,7 +873,7 @@ class Database:
         rows = self.getfile(file)
         for row in rows:
             if row.path == file:
-                return row.id 
+                return row.id
         return None
 
     # Get the total number of files in the files table in the db
@@ -725,13 +881,17 @@ class Database:
         row = None
         with Session(self.engine) as s:
             try:
-                row = s.execute(select(func.count('*')).select_from(Files)).one_or_none()
+                row = s.execute(
+                    select(func.count("*")).select_from(Files)
+                ).one_or_none()
             except Exception as e:
-                    LOGGER.debug("Encountered the following exception in gettotalnumberoffiles while dying")
-                    LOGGER.debug(f"{e}")
-                    if not DYING:
-                        LOGGER.critical("Could not read from database. Exiting. rc=112")
-                        cleanup_and_die(116)
+                LOGGER.debug(
+                    "Encountered the following exception in gettotalnumberoffiles while dying"
+                )
+                LOGGER.debug(f"{e}")
+                if not DYING:
+                    LOGGER.critical("Could not read from database. Exiting. rc=112")
+                    cleanup_and_die(116)
         return row if row is not None else []
 
     # Get files marked as 'destination file exists'
@@ -739,7 +899,9 @@ class Database:
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(
-                    select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.destfileexists==True)
+                select(Files.path, Files.dest, Files.id)
+                .select_from(Files)
+                .where(Files.destfileexists == True)
             ).fetchall()
         return rows
 
@@ -748,7 +910,9 @@ class Database:
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(
-                    select(Files.id, Files.path).select_from(Files).where(Files.path == file)
+                select(Files.id, Files.path)
+                .select_from(Files)
+                .where(Files.path == file)
             ).fetchall()
         return rows
 
@@ -759,7 +923,13 @@ class Database:
         with Session(self.engine) as s:
             while True:
                 rows = s.execute(
-                        select(Files.path, Files.dest, Files.id).select_from(Files).where(Files.vv == vvid).where(Files.transfer_status != TransferStatus.completed.value).order_by(self.files_tbl.c.id).offset(offset).limit(DB_TX_SIZE)
+                    select(Files.path, Files.dest, Files.id)
+                    .select_from(Files)
+                    .where(Files.vv == vvid)
+                    .where(Files.transfer_status != TransferStatus.completed.value)
+                    .order_by(self.files_tbl.c.id)
+                    .offset(offset)
+                    .limit(DB_TX_SIZE)
                 ).fetchall()
                 yield rows
                 offset += len(rows)
@@ -778,7 +948,9 @@ class Database:
         rows = []
         with Session(self.engine) as s:
             rows = s.execute(
-                    select(distinct(Files.vv)).select_from(Files).where(Files.transfer_status != TransferStatus.completed.value)
+                select(distinct(Files.vv))
+                .select_from(Files)
+                .where(Files.transfer_status != TransferStatus.completed.value)
             ).fetchall()
         return rows
 
@@ -794,11 +966,18 @@ class Database:
         try:
             with Session(self.engine) as s:
                 s.execute(
-                        update(Files).values(destfileexists=True, transfer_status=TransferStatus.skipped.value).where(Files.id == fileid)
+                    update(Files)
+                    .values(
+                        destfileexists=True,
+                        transfer_status=TransferStatus.skipped.value,
+                    )
+                    .where(Files.id == fileid)
                 )
                 s.commit()
         except Exception as e:
-            LOGGER.error(f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}")
+            LOGGER.error(
+                f"Could not commit to DB! Please ensure you have the correct permissions to write file: {self.dbpath}"
+            )
             LOGGER.debug(f"{e}")
             cleanup_and_die(117)
 
@@ -812,7 +991,7 @@ class MigrateJob:
 
         self.disable_checksums = args.disable_checksums
         self.preserve_timestamps = args.preserve_timestamps
-        #self.vvs_per_job = args.vvs_per_job
+        # self.vvs_per_job = args.vvs_per_job
         self.vvs_per_job = 1
         self.addl_flags = args.additional_hsi_flags
         self.overwrite = args.overwrite_existing
@@ -820,13 +999,19 @@ class MigrateJob:
         self.checksum_threads = args.checksum_threads
         self.hsi = "/sw/sources/hpss/bin/hsi"
 
-        self.relative_input_source = f"./{os.path.normpath(args.source)}" if args.source[0] not in ["/","."] else os.path.normpath(args.source)
+        self.relative_input_source = (
+            f"./{os.path.normpath(args.source)}"
+            if args.source[0] not in ["/", "."]
+            else os.path.normpath(args.source)
+        )
         self.input_source = args.source
         self.source = self._get_qualified_hpss_path(self.relative_input_source)
         self.destination = os.path.abspath(os.path.normpath(args.destination))
 
         global DATABASE
-        DATABASE = Database(self.verbose, int(time.time()), self.disable_checksums, debug=args.debug)
+        DATABASE = Database(
+            self.verbose, int(time.time()), self.disable_checksums, debug=args.debug
+        )
 
         # Define the HSIJob that lists all the files recursively in the source directory
         self.ls_job = HSIJob(
@@ -834,7 +1019,9 @@ class MigrateJob:
             self.addl_flags,
             True,
             self.verbose,
-            "ls -a -N -R -P {}".format(self.input_source), # use input_source here to ensure globbing works
+            "ls -a -N -R -P {}".format(
+                self.input_source
+            ),  # use input_source here to ensure globbing works
         )
 
     # Check the destination filesystem for files that match names at the predicted destination directory
@@ -848,14 +1035,18 @@ class MigrateJob:
                 destsize = file[0].sizebytes
                 # Check if file exists in the destination. If it does exist, check if the file sizes are the same. If they're different
                 # Assume that the file is incomplete and overwrite it
-                if os.path.isfile(destpath): 
+                if os.path.isfile(destpath):
                     srcsize = os.path.getsize(destpath)
                     if srcsize == destsize:
                         # Check if indexing complete, and if so, check if the file is 'staging', then do not add, else, mark exists
-                        LOGGER.debug(f"Found existing file {file[0].path}, destination={destpath}, id={fileid}, size={srcsize}")
+                        LOGGER.debug(
+                            f"Found existing file {file[0].path}, destination={destpath}, id={fileid}, size={srcsize}"
+                        )
                         DATABASE.markexists(fileid)
         else:
-            LOGGER.debug("Skipping check for existing files due to --overwrite-existing")
+            LOGGER.debug(
+                "Skipping check for existing files due to --overwrite-existing"
+            )
 
     # Create the destination directory structure
     def createDestTree(self):
@@ -864,20 +1055,22 @@ class MigrateJob:
             try:
                 os.makedirs(path.path, exist_ok=True)
             except FileExistsError:
-                LOGGER.debug("Skipping mkdir of %s; directory already exists", path.path)
+                LOGGER.debug(
+                    "Skipping mkdir of %s; directory already exists", path.path
+                )
                 DATABASE.markdestcreated(path.id)
             except Exception as e:  # pylint: disable=bare-except
                 LOGGER.critical(
-                    "ERROR: Could not create destination directory (%s).\n(%s)", path.path, e
+                    "ERROR: Could not create destination directory (%s).\n(%s)",
+                    path.path,
+                    e,
                 )
                 cleanup_and_die(118)
             else:
                 DATABASE.markdestcreated(path.id)
 
     def runHashList(self, files):
-        infilename = os.path.join(
-            self.filelists_path, f"hsi_xfer.hashlist.list"
-        )
+        infilename = os.path.join(self.filelists_path, f"hsi_xfer.hashlist.list")
         # Write the infile to be passed into HSI
         with open(infilename, "w", encoding="UTF-8") as infile:
             infile.write("\n".join(["hashlist -A {}".format(f[0]) for f in files]))
@@ -897,7 +1090,11 @@ class MigrateJob:
                 for line in chunk:
                     if "md5" in line:
                         checksum, srcpath = line.split(" ")[0], line.split(" ")[-2]
-                        LOGGER.debug("Found preexisting hash for file: %s : %s", srcpath, checksum)
+                        LOGGER.debug(
+                            "Found preexisting hash for file: %s : %s",
+                            srcpath,
+                            checksum,
+                        )
                         ret[srcpath] = checksum
 
         return ret
@@ -928,16 +1125,16 @@ class MigrateJob:
         # Get chunked list of vvs
         allvvs = DATABASE.getvvswithnoncompletefiles()
 
-        #TODO: This may be a problem, if we use --vvs-per-job > 1
+        # TODO: This may be a problem, if we use --vvs-per-job > 1
         vvs = list(chunk(allvvs, int(self.vvs_per_job)))
         LOGGER.debug(f"vvs={vvs}")
-        #TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
-        #if len(vvs) > len(allvvs):
+        # TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
+        # if len(vvs) > len(allvvs):
         #    vvs = []
         #    for lst in chunk(allvvs, int(self.vvs_per_job)):
         #        vvs.append(list(lst))
 
-        LOGGER.info(f"Will generate {len(vvs)} file lists", extra={'block':'cli'})
+        LOGGER.info(f"Will generate {len(vvs)} file lists", extra={"block": "cli"})
 
         # Get list of exisitng files from the db
         existingFiles = DATABASE.getexistingfiles()
@@ -953,15 +1150,15 @@ class MigrateJob:
                 existing.append({"source": f[0], "destination": f[1]})
             LOGGER.debug(json.dumps(existing, indent=2))
 
-        LOGGER.info(
-            "Creating file lists from indexed HPSS data..."
-        )
+        LOGGER.info("Creating file lists from indexed HPSS data...")
 
         # Set some variables for status output (esp if not using the progress bar)
         filelistnum = 0
         filesCompleted = len(existingFiles)
         filesTotal = DATABASE.gettotalnumberoffiles()[0]
-        LOGGER.info(f"Will transfer {filesTotal} files from HPSS", extra={'block':'cli'})
+        LOGGER.info(
+            f"Will transfer {filesTotal} files from HPSS", extra={"block": "cli"}
+        )
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
         # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
@@ -984,23 +1181,28 @@ class MigrateJob:
                 infilename = os.path.join(
                     self.filelists_path, f"hsi_xfer.{filelistnum}.list"
                 )
-                with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(tmphashfilename, "a", encoding="UTF-8") as hashfile:
+                with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(
+                    tmphashfilename, "a", encoding="UTF-8"
+                ) as hashfile:
                     for chunk in DATABASE.getfilesbyvv(vv[0]):
                         files = chunk
                         files = [f for f in files if f not in existingFiles]
 
-                        #TODO: Ensure that this does not kill performance
+                        # TODO: Ensure that this does not kill performance
                         # We're going to be writing multiple gets and hashcreate commands here
                         # Write each to a separate file, and append to infile at the end?
                         if len(files) > 0:
-                            LOGGER.debug("Writing list of %s files to temporary file list...", len(chunk))
+                            LOGGER.debug(
+                                "Writing list of %s files to temporary file list...",
+                                len(chunk),
+                            )
 
                             # Do a hashlist to get files that have hashes already
                             hashlistout = self.runHashList(files)
                             # if file has hash; save to db
                             self.writeExistingHashes(hashlistout)
                             # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
-                            to_hash = [ f for f in files if f[0] not in hashlistout ]
+                            to_hash = [f for f in files if f[0] not in hashlistout]
 
                             getfile.write(
                                 "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
@@ -1010,7 +1212,9 @@ class MigrateJob:
                             # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
                             # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
                             if not self.disable_checksums and len(to_hash) > 0:
-                                hashfile.write("\n".join(["{}".format(f[0]) for f in to_hash]))
+                                hashfile.write(
+                                    "\n".join(["{}".format(f[0]) for f in to_hash])
+                                )
                                 hashfile.write("\n")
 
                 if len(files) > 0:
@@ -1020,7 +1224,11 @@ class MigrateJob:
                         hashfilelen = sum(1 for _ in hashfile)
 
                     # Combine both the hashfile and getfile here
-                    with open(infilename, "w", encoding="UTF-8") as infile, open(tmpgetfilename, "r", encoding="UTF-8") as getfile, open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                    with open(infilename, "w", encoding="UTF-8") as infile, open(
+                        tmpgetfilename, "r", encoding="UTF-8"
+                    ) as getfile, open(
+                        tmphashfilename, "r", encoding="UTF-8"
+                    ) as hashfile:
                         LOGGER.debug("Combining temporary file lists")
                         # Write the infile to be passed into HSI
                         getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T on << EOF\n"
@@ -1054,7 +1262,10 @@ class MigrateJob:
                     )
                     if first_iter:
                         LOGGER.info(
-                            "Launching a sorted batch migration of files from %s to %s (dry-run=%s)", self.source, self.destination, self.dry_run
+                            "Launching a sorted batch migration of files from %s to %s (dry-run=%s)",
+                            self.source,
+                            self.destination,
+                            self.dry_run,
                         )
                     if not self.dry_run:
                         for f in files:
@@ -1067,35 +1278,54 @@ class MigrateJob:
                             for line in chunk:
                                 # Log output to the user every 30s or if its the first iteration
                                 now = int(time.time())
-                                if ((now - last_notif_time) >= 60) or (first_iter is True):
+                                if ((now - last_notif_time) >= 60) or (
+                                    first_iter is True
+                                ):
                                     first_iter = False
                                     last_notif_time = now
                                     LOGGER.info(
                                         "%s/%s file transfers have been attempted",
                                         filesCompleted,
                                         filesTotal,
-                                        extra={'block':'syslog'},
+                                        extra={"block": "syslog"},
                                     )
                                 # Log output to syslog every 10% of total or if its the first iteration
-                                if ((filesCompleted/filesTotal * 100) % 10 == 0 and last_notif_idx != filesCompleted) or (first_iter is True):
+                                if (
+                                    (filesCompleted / filesTotal * 100) % 10 == 0
+                                    and last_notif_idx != filesCompleted
+                                ) or (first_iter is True):
                                     first_iter = False
                                     last_notif_idx = filesCompleted
-                                    payload = { "filescompleted": filesCompleted, "filestotal": filesTotal }
+                                    payload = {
+                                        "filescompleted": filesCompleted,
+                                        "filestotal": filesTotal,
+                                    }
                                     LOGGER.info(
                                         json.dumps(payload),
-                                        extra={'block':'cli'},
+                                        extra={"block": "cli"},
                                     )
 
                                 if "(md5)" in line:
-                                    checksum, srcpath = line.split(" ")[0], line.split(" ")[-1]
+                                    checksum, srcpath = (
+                                        line.split(" ")[0],
+                                        line.split(" ")[-1],
+                                    )
                                     DATABASE.setsrcchecksum(srcpath, checksum)
                                     DATABASE.markfileashpsschecksumcomplete(srcpath)
 
-                                matches = re.match(r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?", line)
+                                matches = re.match(
+                                    r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?",
+                                    line,
+                                )
                                 if matches:
                                     srcpath = matches.group(2)
                                     filesCompleted += 1
-                                    LOGGER.debug("Processed (%s/%s) files: %s", filesCompleted, filesTotal, srcpath)
+                                    LOGGER.debug(
+                                        "Processed (%s/%s) files: %s",
+                                        filesCompleted,
+                                        filesTotal,
+                                        srcpath,
+                                    )
                                     DATABASE.markfileastransfercompleted(srcpath)
 
                                 if "get: Error" in line:
@@ -1105,21 +1335,24 @@ class MigrateJob:
                                     )
                                     DATABASE.markasfailed(line.split(" ")[-1])
                         # Log the last notifications
-                        LOGGER.info("%s/%s file transfers have been attempted",
-                                        filesCompleted,
-                                        filesTotal,
-                                        extra={'block':'syslog'},
-                        )
-                        payload = { "filescompleted": filesCompleted, "filestotal": filesTotal }
                         LOGGER.info(
-                            json.dumps(payload),
-                            extra={'block':'cli'}
+                            "%s/%s file transfers have been attempted",
+                            filesCompleted,
+                            filesTotal,
+                            extra={"block": "syslog"},
                         )
+                        payload = {
+                            "filescompleted": filesCompleted,
+                            "filestotal": filesTotal,
+                        }
+                        LOGGER.info(json.dumps(payload), extra={"block": "cli"})
                         PROFILER.snapshot()
                     else:
                         LOGGER.info("Would have run: %s", migration_job.getcommand())
                 else:
-                    LOGGER.debug("Skipping file list due to existing files. Use --overwrite-existing to bypass this")
+                    LOGGER.debug(
+                        "Skipping file list due to existing files. Use --overwrite-existing to bypass this"
+                    )
         return 0
 
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
@@ -1194,8 +1427,8 @@ class MigrateJob:
             starttime = DATABASE.getstarttime()
             endtime = int(time.time())
             # Default to 1 second elapsed here just to prevent divide by zero
-            elapsed = (endtime - starttime) if (endtime-starttime) > 0 else 1
-            bps = (totalsize/1000/1000)/elapsed
+            elapsed = (endtime - starttime) if (endtime - starttime) > 0 else 1
+            bps = (totalsize / 1000 / 1000) / elapsed
             report["average_speed"] = bps
             report["elapsed_time"] = elapsed
             report["total_size_in_bytes"] = totalsize
@@ -1217,8 +1450,8 @@ class MigrateJob:
         return path
 
     def _get_qualified_hpss_path(self, path):
-        #path = os.path.normpath(path) if path[0] not in [".","/"] else path
-        #path = os.path.normpath(path)
+        # path = os.path.normpath(path) if path[0] not in [".","/"] else path
+        # path = os.path.normpath(path)
         while any(char in "*?[]" for char in path):
             path = os.path.dirname(path)
 
@@ -1236,13 +1469,13 @@ class MigrateJob:
                     if "DIRECTORY" in line:
                         return line.split("\t")[-1]
                     elif "FILE" in line:
-                        LOGGER.critical("Invalid source path provided. Single file transfers are not supported! Please replace the source path with a directory")
+                        LOGGER.critical(
+                            "Invalid source path provided. Single file transfers are not supported! Please replace the source path with a directory"
+                        )
                         cleanup_and_die(118)
 
         # Last ditch effort, just basically do _hpss_root_dir on path
         return path
-
-
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
@@ -1250,8 +1483,10 @@ class MigrateJob:
         if not DATABASE.get_state().indexing_complete:
             start = int(time.time())
             cur = start
-            for chunk in self.ls_job.run(): 
-                LOGGER.debug(f"Got {len(chunk)} files from HSI. Retrival took {int(time.time())-cur}s")
+            for chunk in self.ls_job.run():
+                LOGGER.debug(
+                    f"Got {len(chunk)} files from HSI. Retrival took {int(time.time())-cur}s"
+                )
                 files = []
                 dirs = set()
 
@@ -1268,21 +1503,35 @@ class MigrateJob:
 
                 dstart = int(time.time())
                 # Removing junk from array
-                dirs = [DestTree(created=False, path=d.replace(self._hpss_root_dir, self.destination, 1)) for d in dirs if d.replace(self._hpss_root_dir, self.destination, 1) not in DATABASE.desttrees ]
+                dirs = [
+                    DestTree(
+                        created=False,
+                        path=d.replace(self._hpss_root_dir, self.destination, 1),
+                    )
+                    for d in dirs
+                    if d.replace(self._hpss_root_dir, self.destination, 1)
+                    not in DATABASE.desttrees
+                ]
                 # Adding the root destination since files can be at depth 0, and we want to make sure its there
                 if self.destination not in DATABASE.desttrees:
                     dirs.append(DestTree(created=False, path=self.destination))
                 if len(dirs) > 0:
                     DATABASE.insertdesttree(dirs)
                 if len(files) > 0:
-                    DATABASE.insertfiles(files, self._hpss_root_dir, self.destination, self.source)
+                    DATABASE.insertfiles(
+                        files, self._hpss_root_dir, self.destination, self.source
+                    )
                 LOGGER.debug(f"Database operation took {int(time.time())-dstart}s")
                 cur = int(time.time())
             LOGGER.debug(f"Updating database state table")
             DATABASE.update_state(indexing_complete=True)
             if DATABASE.gettotalnumberoffiles()[0] == 0:
-                LOGGER.critical(f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.destination}")
-                LOGGER.critical(f"Use --overwrite-existing to overwrite files in the destination directory")
+                LOGGER.critical(
+                    f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.destination}"
+                )
+                LOGGER.critical(
+                    f"Use --overwrite-existing to overwrite files in the destination directory"
+                )
                 cleanup_and_die(119)
         else:
             LOGGER.info("Skipping file indexing due to input cache")
@@ -1303,7 +1552,9 @@ def doDestChecksum(file):
     if not os.path.exists(file[1]):
         time.sleep(10)
         if not os.path.exists(file[1]):
-            LOGGER.error(f"Could not checksum file {file[1]}! Can not guarantee file integrity")
+            LOGGER.error(
+                f"Could not checksum file {file[1]}! Can not guarantee file integrity"
+            )
             return {
                 "path": file[1],
                 "checksum": None,
@@ -1378,7 +1629,7 @@ class HSIJob:
         ignore_rc = False
         sinceLastYield = int(time.time())
         for line in p.stdout:
-            #last ditch effort to kill HSI
+            # last ditch effort to kill HSI
             if DYING:
                 LOGGER.info(f"Killing HSI process {p.pid}")
                 p.kill()
@@ -1389,7 +1640,7 @@ class HSIJob:
                 encountered_err = False
                 errline = ""
             elif encountered_err is True and ".Trash" not in line:
-                LOGGER.error('\n'.join([errline, line]))
+                LOGGER.error("\n".join([errline, line]))
                 encountered_err = False
                 errline = ""
 
@@ -1398,10 +1649,12 @@ class HSIJob:
                 errline = line
 
             # Use output as a buffer, and maybe yield the buffer to the parent function
-            # Where the output is processed as it comes in. 
+            # Where the output is processed as it comes in.
             output.append(line.strip())
             if len(output) >= DB_TX_SIZE:
-                LOGGER.debug(f"HSI list speed: {DB_TX_SIZE/(int(time.time())-sinceLastYield)} lines/sec")
+                LOGGER.debug(
+                    f"HSI list speed: {DB_TX_SIZE/(int(time.time())-sinceLastYield)} lines/sec"
+                )
                 sinceLastYield = int(time.time())
                 yield output
                 output.clear()
@@ -1434,11 +1687,13 @@ class HSIJob:
 
 def handler_filter(handler):
     def logger_filter(extra):
-        if hasattr(extra, 'block'):
+        if hasattr(extra, "block"):
             if extra.block in handler:
                 return False
         return True
+
     return logger_filter
+
 
 def initPrelogger():
     global LOGGER
@@ -1449,10 +1704,11 @@ def initPrelogger():
     cliHandler = logging.StreamHandler()
     cliHandler.setLevel(loglevel)
     cliHandler.setFormatter(CustomFormatter())
-    cliHandler.name = 'preCliHandler'
-    cliHandler.addFilter(handler_filter('pre'))
+    cliHandler.name = "preCliHandler"
+    cliHandler.addFilter(handler_filter("pre"))
     LOGGER.addHandler(cliHandler)
-    
+
+
 def initLogger(verbose):
     global LOGGER
     LOGGER = None
@@ -1469,14 +1725,16 @@ def initLogger(verbose):
     cliHandler = logging.StreamHandler()
     cliHandler.setLevel(loglevel)
     cliHandler.setFormatter(CustomFormatter())
-    cliHandler.name = 'cliHandler'
-    cliHandler.addFilter(handler_filter('cli'))
+    cliHandler.name = "cliHandler"
+    cliHandler.addFilter(handler_filter("cli"))
 
-    syslogHandler = logging.handlers.SysLogHandler(address='/dev/log')
-    syslogHandler.setFormatter(logging.Formatter(f'hsi_xfer: (user={username}) %(message)s'))
+    syslogHandler = logging.handlers.SysLogHandler(address="/dev/log")
+    syslogHandler.setFormatter(
+        logging.Formatter(f"hsi_xfer: (user={username}) %(message)s")
+    )
     syslogHandler.setLevel(logging.INFO)
-    syslogHandler.name = 'syslogHandler'
-    syslogHandler.addFilter(handler_filter('syslog'))
+    syslogHandler.name = "syslogHandler"
+    syslogHandler.addFilter(handler_filter("syslog"))
 
     LOGGER.addHandler(cliHandler)
     LOGGER.addHandler(syslogHandler)
@@ -1484,33 +1742,38 @@ def initLogger(verbose):
     if verbose:
         LOGGER.debug("Set logger to debug because --verbose")
 
-class Profiler():
+
+class Profiler:
     def __init__(self, trace):
         self.trace = trace
         if trace:
             tracemalloc.start(10)
-        
+
     def snapshot(self):
-        if self.trace: 
+        if self.trace:
             self.snap = tracemalloc.take_snapshot()
 
     def print_report(self):
-        if self.trace: 
+        if self.trace:
             snap = self.snap
             idx = 0
-            for stats in snap.statistics("lineno"):  
-                print(f"========== SNAPSHOT {idx} =============")  
-                print(stats)  
-                print(stats.traceback.format())  
+            for stats in snap.statistics("lineno"):
+                print(f"========== SNAPSHOT {idx} =============")
+                print(stats)
+                print(stats.traceback.format())
                 idx += 1
-              
-            print("\n=========== USEFUL METHODS ===========")  
-            print("\nTraceback Limit : ", tracemalloc.get_traceback_limit(), " Frames")  
-              
-            print("\nTraced Memory (Current, Peak): ", tracemalloc.get_traced_memory())  
-              
-            print("\nMemory Usage by tracemalloc Module : ", tracemalloc.get_tracemalloc_memory(), " bytes")  
-                  
+
+            print("\n=========== USEFUL METHODS ===========")
+            print("\nTraceback Limit : ", tracemalloc.get_traceback_limit(), " Frames")
+
+            print("\nTraced Memory (Current, Peak): ", tracemalloc.get_traced_memory())
+
+            print(
+                "\nMemory Usage by tracemalloc Module : ",
+                tracemalloc.get_tracemalloc_memory(),
+                " bytes",
+            )
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1587,7 +1850,7 @@ def main():
         type=str,
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
-    #parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
+    # parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
     parser.add_argument(
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
     )
@@ -1615,27 +1878,45 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose)
-    
-    #if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
-    if args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
-        LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
-       # LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --checksum-threads={args.checksum_threads}", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --debug={args.debug}", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --db-tx-size={args.db_tx_size}", extra={'block':'cli'})
-        LOGGER.error(f"Flag: --trace={args.trace}", extra={'block':'cli'})
-        
+
+    # if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
+    if (
+        args.debug
+        or args.disable_ta
+        or args.db_tx_size != 9000
+        or args.trace
+        or args.checksum_threads != 4
+    ):
+        LOGGER.error("Hidden flag usage detected", extra={"block": "cli"})
+        # LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
+        LOGGER.error(
+            f"Flag: --checksum-threads={args.checksum_threads}", extra={"block": "cli"}
+        )
+        LOGGER.error(f"Flag: --debug={args.debug}", extra={"block": "cli"})
+        LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={"block": "cli"})
+        LOGGER.error(f"Flag: --db-tx-size={args.db_tx_size}", extra={"block": "cli"})
+        LOGGER.error(f"Flag: --trace={args.trace}", extra={"block": "cli"})
 
     global CACHE
     cleanup_db = True
-    cleanup_filelists = not args.preserve_file_lists # The logic here is inverse so we ! the flags value
+    cleanup_filelists = (
+        not args.preserve_file_lists
+    )  # The logic here is inverse so we ! the flags value
     if args.preserve_cache:
         cleanup_db = False
         cleanup_filelists = False
 
-    LOGGER.debug(f"Creating cache: preserved_files_path={args.preserved_files_path} cleanup_filelists={cleanup_filelists} cleanup_db={cleanup_db} existing_path={args.cache_path} debug={args.debug}")
-    CACHE = Cache(args.verbose, args.preserved_files_path, cleanup_filelists=cleanup_filelists, cleanup_db=cleanup_db, existing_path=args.cache_path, debug=args.debug)
+    LOGGER.debug(
+        f"Creating cache: preserved_files_path={args.preserved_files_path} cleanup_filelists={cleanup_filelists} cleanup_db={cleanup_db} existing_path={args.cache_path} debug={args.debug}"
+    )
+    CACHE = Cache(
+        args.verbose,
+        args.preserved_files_path,
+        cleanup_filelists=cleanup_filelists,
+        cleanup_db=cleanup_db,
+        existing_path=args.cache_path,
+        debug=args.debug,
+    )
 
     global DB_TX_SIZE
     DB_TX_SIZE = args.db_tx_size
@@ -1643,7 +1924,11 @@ def main():
     global PROFILER
     PROFILER = Profiler(args.trace)
 
-    LOGGER.info("Starting sorted batch transfer from HPSS (%s) to destination (%s)", args.source, args.destination)
+    LOGGER.info(
+        "Starting sorted batch transfer from HPSS (%s) to destination (%s)",
+        args.source,
+        args.destination,
+    )
     # Create our migration job
     job = MigrateJob(args)
 
@@ -1678,7 +1963,7 @@ def main():
     report = {}
     if not args.dry_run and not args.disable_checksums:
         destchecksumThread.start()
-        #Wait for checksumming to finish. If you wanna do more things, do them here?
+        # Wait for checksumming to finish. If you wanna do more things, do them here?
         destchecksumThread.join()
         # Generate our report
         report = job.checksumMismatchReport()
@@ -1690,9 +1975,7 @@ def main():
     LOGGER.debug(json.dumps(finalreport, indent=2))
 
     # Write the report to a file
-    reportfilename = "hsi_xfer_report_{}.json".format(
-        int(time.time())
-    )
+    reportfilename = "hsi_xfer_report_{}.json".format(int(time.time()))
     reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
     with open(reportfilename, "w", encoding="UTF-8") as f:
         json.dump(finalreport, f, indent=2)
@@ -1701,33 +1984,37 @@ def main():
         LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
         syslogpayload = {
-                'total_size_in_bytes': finalreport['total_size_in_bytes'],
-                'elapsed_time': finalreport['elapsed_time'],
-                'num_successful_files': len(finalreport['successful_transfers']),
-                'num_failed_files': len(finalreport['failed_transfers']),
-                'num_files_failed_to_checksum': len(finalreport['failed_to_checksum']),
-                'num_files_skipped': len(finalreport['existing_files_skipped']),
+            "total_size_in_bytes": finalreport["total_size_in_bytes"],
+            "elapsed_time": finalreport["elapsed_time"],
+            "num_successful_files": len(finalreport["successful_transfers"]),
+            "num_failed_files": len(finalreport["failed_transfers"]),
+            "num_files_failed_to_checksum": len(finalreport["failed_to_checksum"]),
+            "num_files_skipped": len(finalreport["existing_files_skipped"]),
         }
 
-        LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={'block':'cli'})
+        LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={"block": "cli"})
 
     PROFILER.print_report()
     DATABASE.cleanup()
     CACHE.cleanup()
     LOCKFILE.cleanup()
 
+
 def __handle_sigs(signum, frame):
     global DYING
     if not DYING:
-        LOGGER.error(f"Caught signal: {signum}, Exiting... Please wait for cleanup to finish.")
+        LOGGER.error(
+            f"Caught signal: {signum}, Exiting... Please wait for cleanup to finish."
+        )
         LOGGER.debug(traceback.format_exc())
-        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
+        LOGGER.info(traceback.format_exc(), extra={"block": "cli"})
         DYING = True
         cleanup_and_die(999)
 
+
 def cleanup_and_die(rc, delete_lockfile=True):
     if rc != 0:
-        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
+        LOGGER.info(traceback.format_exc(), extra={"block": "cli"})
     if DATABASE is not None:
         DATABASE.cleanup()
     if CACHE is not None:
@@ -1738,11 +2025,14 @@ def cleanup_and_die(rc, delete_lockfile=True):
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except Exception as e:
-                LOGGER.error(f"Could not kill PID {pid}. Please ensure this process has been killed before restarting!")
+                LOGGER.error(
+                    f"Could not kill PID {pid}. Please ensure this process has been killed before restarting!"
+                )
                 LOGGER.debug(e)
     if LOCKFILE is not None and delete_lockfile is True:
         LOCKFILE.cleanup()
     sys.exit(rc)
+
 
 def entrypoint():
     signal.signal(signal.SIGTERM, __handle_sigs)
@@ -1752,14 +2042,16 @@ def entrypoint():
         # This will be overwritten in main()
         initPrelogger()
         global LOCKFILE
-        LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
+        LOCKFILE = LockFile(os.path.expanduser("~/.hsi-xfer.lock"))
         # Can we get a lockfile and if not, error and exit
         LOCKFILE.lock()
         sys.exit(main())
-    #Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
+    # Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
     except Exception as e:
         DYING = True
-        LOGGER.error(f"Caught exception: {e}, Exiting... Please wait for cleanup to finish.")
+        LOGGER.error(
+            f"Caught exception: {e}, Exiting... Please wait for cleanup to finish."
+        )
         LOGGER.debug(traceback.format_exc())
-        LOGGER.info(traceback.format_exc(), extra={'block':'cli'})
+        LOGGER.info(traceback.format_exc(), extra={"block": "cli"})
         cleanup_and_die(99)
