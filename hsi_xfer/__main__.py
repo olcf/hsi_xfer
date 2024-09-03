@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import fcntl
 import getpass
 import socket
 import logging.handlers
@@ -95,98 +96,34 @@ PIDS = []
 class LockFile():
     def __init__(self, path):
         self.path = path
-        self.pid = os.getpid()
-        self.hostname = socket.getfqdn()
-        self.start = int(time.time())
-        # create lockffile if it doesn't exist
-        #TODO: We may need to sit and retry here?
-        if not os.path.exists(path):
-            self.create_lockfile()
+        self.lockfile = None
 
     def __del__(self):
         self.cleanup()
 
-    def cleanup(self):
-        if os.path.exists(self.path):
-            lfdata = None
-            with open(self.path, 'r') as lf:
-                lfdata = json.load(lf)
-            if lfdata["pid"] == self.pid:
-                os.remove(self.path)
-            else:
-                LOGGER.debug("Not removing lockfile since PIDs do not match")
-
-    def pid_exists(self, pid):        
+    def lock(self):
+        f = open(self.path, "w")
         try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        else:
-            return True
-
-    def create_lockfile(self):
-        payload = {
-                'start': self.start,
-                'pid': self.pid,
-                'hostname': self.hostname,
-        }
-        try:
-            with open(self.path, 'w') as lf:
-                lf.write(json.dumps(payload))
-            #try 3 times to see if the lockfile got written. If not, then we should die here
-            exists = False
-            for i in range(0,FILE_RETRY_LIMIT): 
-                if not os.path.exists(self.path):
-                    time.sleep(5)
-                else:
-                    exists = True
-                    break
-            if exists is False:
-                LOGGER.error("Could not write lockfile! Please try again.")
-                cleanup_and_die(995)
-            LOGGER.debug(f"Created lockfile: {self.path}")
-        except Exception as e:
-            LOGGER.error('Error creating lockfile. Can not find user home directory?')
-            LOGGER.debug(e)
-            cleanup_and_die(998)
-
-    def check_lockfile_valid(self):
-        lfdata = None
-        # Check to see if the file exists: it should be created by this point. If not wait...
-        try:
-            with open(self.path, 'r') as lf:
-                lfdata = json.load(lf)
-        except Exception as e:
-            LOGGER.error(f"Could not read lockfile after writing! Try again, or contact User Assistance")
-            LOGGER.debug(e)
-            cleanup_and_die(996)
-
-        # If lockfile expired: remove it and create a new one
-        if (self.start - lfdata['start'] >=259200):
-            os.remove(self.path)
-            self.create_lockfile()
-            return 
-
-        if (self.pid != lfdata['pid']):
-            # if the lockfile exists and pids are different, and:
-            # * the pid does not exist and the hostname is the same: assume defunct lockfile and replace
-            # * the pid does not exist and the hostname is different: fail
-            # * the pid does exist and the hostname is different: fail
-            # * the pid does exist and the hostname is the same: fail
-            if (not self.pid_exists(lfdata['pid'])) and (self.hostname == lfdata['hostname']):
-                os.remove(self.path)
-                self.create_lockfile()
-            else:
-                self.fail()
-            
-        # If the hostnames don't match, then just die b/c we can't assume that the pid exists or not there
-        if (self.hostname != lfdata['hostname']):
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except:
             self.fail()
+        self.lockfile = f
 
-    def fail(self):
+    def unlock(self):
+        if self.lockfile is not None:
+            fcntl.flock(self.lockfile, fcntl.LOCK_UN)
+            if os.path.exists(self.path):
+                os.close(self.lockfile.fileno())
+                self.lockfile = None
+                os.remove(self.path)
+
+    def cleanup(self):
+         self.unlock()
+
+    def fail(self, delete_lockfile=True):
         LOGGER.error('Error locking process! Please ensure no other hsi_xfer processes are running under your username on any node in this cluster!')
         LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
-        cleanup_and_die(997, delete_lockfile=False)
+        cleanup_and_die(997, delete_lockfile=delete_lockfile)
 
 class CustomFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
@@ -297,6 +234,11 @@ class Cache:
             )
             self.dbpath = os.path.join(self.cache_path, "database.db")
             self.filelists_root_path = os.path.join(self.cache_path, "filelists")
+            if os.path.exists(self.dbpath):
+                # If we get here something weird went wrong! Like a user trying to run 2 within the same second
+                LOGGER.error('Error locking process! Ensure there is only one hsi_xfer process running, and that any hsi_xfer*.cache directories are cleaned up')
+                LOGGER.error('To maximize availability of transfer resources for all users, there is a limit of one active hsi_xfer operation per user')
+                cleanup_and_die(201)
         else:
             # Cache exists; resuming
             self.archive_path = self.existing_path
@@ -532,7 +474,7 @@ class Database:
                 self.insertvv(vv)
                 vvid = self.vvExists(vv) 
                 if vvid is None:
-                    LOGGER.fatal("Insert of VV failed!")
+                    LOGGER.error("Insert of VV failed!")
                     cleanup_and_die(100)
 
             destid = self.getdest(dest)[0] # This can do a select for each file
@@ -1468,8 +1410,8 @@ class HSIJob:
         PIDS.remove(p.pid)
 
         if p.returncode != 0 and not ignore_rc:
-            LOGGER.fatal(f"HSI failed to run! Returned rc={p.returncode}")
-            LOGGER.fatal(
+            LOGGER.error(f"HSI failed to run! Returned rc={p.returncode}")
+            LOGGER.error(
                 "Unable to get file data from HPSS or process killed",
             )
             for line in output:
@@ -1493,13 +1435,27 @@ class HSIJob:
 def handler_filter(handler):
     def logger_filter(extra):
         if hasattr(extra, 'block'):
-            if extra.block == handler:
+            if extra.block in handler:
                 return False
         return True
     return logger_filter
 
+def initPrelogger():
+    global LOGGER
+    loglevel = logging.WARNING
+    LOGGER = logging.getLogger("pre_hsi_xfer")
+    LOGGER.setLevel(loglevel)
+
+    cliHandler = logging.StreamHandler()
+    cliHandler.setLevel(loglevel)
+    cliHandler.setFormatter(CustomFormatter())
+    cliHandler.name = 'preCliHandler'
+    cliHandler.addFilter(handler_filter('pre'))
+    LOGGER.addHandler(cliHandler)
+    
 def initLogger(verbose):
     global LOGGER
+    LOGGER = None
 
     loglevel = logging.INFO
     if verbose:
@@ -1660,11 +1616,6 @@ def main():
 
     initLogger(args.verbose)
     
-    global LOCKFILE
-    LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
-   # # Can we get a lockfile and if not, error and exit
-    LOCKFILE.check_lockfile_valid()
-
     #if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
     if args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
         LOGGER.error("Hidden flag usage detected", extra={'block':'cli'})
@@ -1797,6 +1748,13 @@ def entrypoint():
     signal.signal(signal.SIGTERM, __handle_sigs)
     signal.signal(signal.SIGINT, __handle_sigs)
     try:
+        # Create a temporary logger for the LOCKFILE here.
+        # This will be overwritten in main()
+        initPrelogger()
+        global LOCKFILE
+        LOCKFILE = LockFile(os.path.expanduser('~/.hsi-xfer.lock'))
+        # Can we get a lockfile and if not, error and exit
+        LOCKFILE.lock()
         sys.exit(main())
     #Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
     except Exception as e:
