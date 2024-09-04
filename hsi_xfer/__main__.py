@@ -1021,7 +1021,7 @@ class MigrateJob:
             self.addl_flags,
             True,
             self.verbose,
-            "ls -a -N -R -P {}".format(
+            "ls -a -N -R -P '{}'".format(
                 self.input_source
             ),  # use input_source here to ensure globbing works
         )
@@ -1462,7 +1462,7 @@ class MigrateJob:
             self.addl_flags,
             True,
             self.verbose,
-            "ls -aNPd {}".format(path),
+            "ls -aNPd '{}'".format(path),
         )
 
         for chunk in ls_job.run():
