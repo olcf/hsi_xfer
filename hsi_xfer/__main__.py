@@ -93,6 +93,8 @@ PIDS = []
 #
 # =============================================================================
 
+def sanitize(path):
+    return path.replace(" ", "\ ")
 
 class LockFile:
     def __init__(self, path):
@@ -1069,11 +1071,11 @@ class MigrateJob:
             else:
                 DATABASE.markdestcreated(path.id)
 
-    def runHashList(self, files):
-        infilename = os.path.join(self.filelists_path, f"hsi_xfer.hashlist.list")
+    def runHashList(self, files, filelistnum):
+        infilename = os.path.join(self.filelists_path, f"hsi_xfer.hashlist.{filelistnum}.list")
         # Write the infile to be passed into HSI
         with open(infilename, "w", encoding="UTF-8") as infile:
-            infile.write("\n".join(["hashlist -A {}".format(f[0]) for f in files]))
+            infile.write("\n".join(["hashlist -A {}".format(sanitize(f[0])) for f in files]))
             infile.write("\n")
 
         hashlist_job = HSIJob(
@@ -1127,7 +1129,7 @@ class MigrateJob:
 
         # TODO: This may be a problem, if we use --vvs-per-job > 1
         vvs = list(chunk(allvvs, int(self.vvs_per_job)))
-        LOGGER.debug(f"vvs={vvs}")
+
         # TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
         # if len(vvs) > len(allvvs):
         #    vvs = []
@@ -1198,14 +1200,14 @@ class MigrateJob:
                             )
 
                             # Do a hashlist to get files that have hashes already
-                            hashlistout = self.runHashList(files)
+                            hashlistout = self.runHashList(files, filelistnum)
                             # if file has hash; save to db
                             self.writeExistingHashes(hashlistout)
                             # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
                             to_hash = [f for f in files if f[0] not in hashlistout]
 
                             getfile.write(
-                                "\n".join(["{} : {}".format(f[1], f[0]) for f in files])
+                                "\n".join(["{} : {}".format(sanitize(f[1]), sanitize(f[0])) for f in files])
                             )
                             getfile.write("\n")
                             # Add a hashcreate command to generate and get hashes in the same job.
@@ -1213,7 +1215,7 @@ class MigrateJob:
                             # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
                             if not self.disable_checksums and len(to_hash) > 0:
                                 hashfile.write(
-                                    "\n".join(["{}".format(f[0]) for f in to_hash])
+                                    "\n".join(["{}".format(sanitize(f[0])) for f in to_hash])
                                 )
                                 hashfile.write("\n")
 
@@ -1545,7 +1547,7 @@ class MigrateJob:
 def doDestChecksum(file):
     checksum = ""
 
-    cmd = "md5sum {}".format(file[1]).split(" ")
+    cmd = ["md5sum","{}".format(file[1])]
     LOGGER.debug(f"Running { ' '.join(cmd) }")
 
     # Check if file exists or not; When using the TA + NFS sometimes things get weird
@@ -1622,6 +1624,7 @@ class HSIJob:
             universal_newlines=True,
             preexec_fn=os.setsid,
         )
+
         global PIDS
         PIDS.append(p.pid)
         errline = ""
