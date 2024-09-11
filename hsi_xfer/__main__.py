@@ -1631,36 +1631,43 @@ class HSIJob:
         encountered_err = False
         ignore_rc = False
         sinceLastYield = int(time.time())
-        for line in p.stdout:
-            # last ditch effort to kill HSI
-            if DYING:
-                LOGGER.info(f"Killing HSI process {p.pid}")
-                p.kill()
-            if "PASSCODE" in line:
-                print(line)
-            if encountered_err is True and ".Trash" in line:
-                ignore_rc = True
-                encountered_err = False
-                errline = ""
-            elif encountered_err is True and ".Trash" not in line:
-                LOGGER.error("\n".join([errline, line]))
-                encountered_err = False
-                errline = ""
+        try:
+            for line in p.stdout:
+                # last ditch effort to kill HSI
+                if DYING:
+                    LOGGER.info(f"Killing HSI process {p.pid}")
+                    p.kill()
+                if "PASSCODE" in line:
+                    print(line)
+                if encountered_err is True and ".Trash" in line:
+                    ignore_rc = True
+                    encountered_err = False
+                    errline = ""
+                elif encountered_err is True and ".Trash" not in line:
+                    LOGGER.error("\n".join([errline, line]))
+                    encountered_err = False
+                    errline = ""
 
-            if "***" in line and "HPSS_E" in line:
-                encountered_err = True
-                errline = line
+                if "***" in line and "HPSS_E" in line:
+                    encountered_err = True
+                    errline = line
 
-            # Use output as a buffer, and maybe yield the buffer to the parent function
-            # Where the output is processed as it comes in.
-            output.append(line.strip())
-            if len(output) >= DB_TX_SIZE:
-                LOGGER.debug(
-                    f"HSI list speed: {DB_TX_SIZE/(int(time.time())-sinceLastYield)} lines/sec"
-                )
-                sinceLastYield = int(time.time())
-                yield output
-                output.clear()
+                # Use output as a buffer, and maybe yield the buffer to the parent function
+                # Where the output is processed as it comes in.
+                output.append(line.strip())
+                if len(output) >= DB_TX_SIZE:
+                    LOGGER.debug(
+                        f"HSI list speed: {DB_TX_SIZE/(int(time.time())-sinceLastYield)} lines/sec"
+                    )
+                    sinceLastYield = int(time.time())
+                    yield output
+                    output.clear()
+
+        except UnicodeDecodeError as e:
+            LOGGER.error(f"Invalid data received from HSI. Please ensure every file in this directory tree has appropriate permissions")
+            LOGGER.error(f"If you continue to encounter this error, please contact OLCF User Assistance.")
+            LOGGER.error(f"To help debug this, please re-run the command with '--preserve-cache', and provide the cache file location in your ticket.")
+            cleanup_and_die(990)
 
         p.wait()
         PIDS.remove(p.pid)
@@ -1964,6 +1971,7 @@ def main():
     # TODO: Can we overlap these threads at some point?
     # We will need the destchecksumthread to poll the filesystem and DB to detect when files are done transferring
     report = {}
+    global DYING
     if not args.dry_run and not args.disable_checksums:
         destchecksumThread.start()
         # Wait for checksumming to finish. If you wanna do more things, do them here?
@@ -2034,7 +2042,13 @@ def cleanup_and_die(rc, delete_lockfile=True):
                 LOGGER.debug(e)
     if LOCKFILE is not None and delete_lockfile is True:
         LOCKFILE.cleanup()
-    sys.exit(rc)
+    # We can't use sys.exit here because it does not actually kill the main thread.
+    # Thanks Python, real helpful
+    # Calling os._exit(rc) is *bad* but not *terrible*. It will prevent all destructors from running
+    # and does not flush stdout or anything, so you could get into a weird state in your terminal
+    # but we're not using curses or anything here so it should be "fine" <--- famous last words
+    os._exit(rc)
+    #sys.exit(rc)
 
 
 def entrypoint():
@@ -2049,6 +2063,7 @@ def entrypoint():
         # Can we get a lockfile and if not, error and exit
         LOCKFILE.lock()
         sys.exit(main())
+
     # Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
     except Exception as e:
         DYING = True
