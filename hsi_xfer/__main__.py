@@ -892,7 +892,7 @@ class Database:
                 )
                 LOGGER.debug(f"{e}")
                 if not DYING:
-                    LOGGER.critical("Could not read from database. Exiting. rc=112")
+                    LOGGER.critical("Could not read from database. Exiting")
                     cleanup_and_die(116)
         return row if row is not None else []
 
@@ -1608,6 +1608,7 @@ class HSIJob:
     # If you're reading this, PLEASE tell the user they should just use keytabs. Their life will be easier. Our life will be eaiser.
     # Puppies will befriend kittens and the world will be at peace.
     def run(self, continueOnFailure=False):
+        global DYING
         cmd = self.hsi.split(" ")
         if self.flags is not None:
             cmd.extend(self.flags.split(" "))
@@ -1648,7 +1649,7 @@ class HSIJob:
                     encountered_err = False
                     errline = ""
 
-                if "***" in line and "HPSS_E" in line:
+                if ("***" in line and "HPSS_E" in line) or ("***" in line and "error -" in line):
                     encountered_err = True
                     errline = line
 
@@ -1679,7 +1680,7 @@ class HSIJob:
             )
             for line in output:
                 LOGGER.debug(line)
-            if not continueOnFailure:
+            if not continueOnFailure or DYING:
                 cleanup_and_die(120)
 
         PROFILER.snapshot()
