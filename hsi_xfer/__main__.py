@@ -1315,6 +1315,8 @@ class MigrateJob:
                                 line.split(" ")[-1],
                             )
                             DATABASE.markasfailed(line.split(" ")[-1])
+                        #TODO: Add some kind of timer that we can turn on or off to occasionally 
+                        # send a message to stdout saying 'hi i'm alive'
                 # Log the last notifications
                 # TODO: This will only notify at the end of a filelist; make this more granular
                 LOGGER.info(
@@ -1480,8 +1482,6 @@ class MigrateJob:
         return path
 
     def _get_qualified_hpss_path(self, path):
-        # path = os.path.normpath(path) if path[0] not in [".","/"] else path
-        # path = os.path.normpath(path)
         while any(char in "*?[]" for char in path):
             path = os.path.dirname(path)
 
@@ -1509,7 +1509,6 @@ class MigrateJob:
 
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
-        LOGGER.debug(f"_hpss_root_dir={self._hpss_root_dir}")
         if not DATABASE.get_state().indexing_complete:
             start = int(time.time())
             cur = start
@@ -1517,7 +1516,6 @@ class MigrateJob:
                 LOGGER.debug(
                     f"Got {len(chunk)} entries from HSI. Retrival took {int(time.time())-cur}s"
                 )
-                LOGGER.debug(f"{chunk}")
 
                 files = []
                 dirs = set()
