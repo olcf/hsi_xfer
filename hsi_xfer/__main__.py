@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import math
 import fcntl
 import getpass
 import socket
@@ -40,6 +41,8 @@ from typing import List
 from typing import Optional
 
 
+VVS_PER_JOB = 1
+MIGRATION_THREADS = 2
 FILE_RETRY_LIMIT = 3
 LOGGER = None
 LOCKFILE = None
@@ -52,7 +55,7 @@ DYING = False
 PIDS = []
 
 # NOTE: If you want to batch up EVERYTHING into a single HSI job,
-# set --vvs-per-job=-1
+# set --parallel-migration-count=-1
 
 # =============================================================================
 # hsi_xfer.py
@@ -879,6 +882,24 @@ class Database:
         return None
 
     # Get the total number of files in the files table in the db
+    def gettotalnumberofvvs(self) -> list:
+        row = None
+        with Session(self.engine) as s:
+            try:
+                row = s.execute(
+                    select(func.count("*")).select_from(VV)
+                ).one_or_none()
+            except Exception as e:
+                LOGGER.debug(
+                    "Encountered the following exception in gettotalnumberofvvs while dying"
+                )
+                LOGGER.debug(f"{e}")
+                if not DYING:
+                    LOGGER.critical("Could not read from database. Exiting")
+                    cleanup_and_die(112)
+        return row if row is not None else []
+
+    # Get the total number of files in the files table in the db
     def gettotalnumberoffiles(self):
         row = None
         with Session(self.engine) as s:
@@ -919,7 +940,7 @@ class Database:
         return rows
 
     # Get a list of files by VV (DB) id
-    def getfilesbyvv(self, vvid):
+    def getfilesbyvvlist(self, vvids):
         rows = []
         offset = 0
         with Session(self.engine) as s:
@@ -927,7 +948,8 @@ class Database:
                 rows = s.execute(
                     select(Files.path, Files.dest, Files.id)
                     .select_from(Files)
-                    .where(Files.vv == vvid)
+                    .where(Files.vv.in_(vvids))
+                    #            .where(Files.vv == vvid)
                     .where(Files.transfer_status != TransferStatus.completed.value)
                     .order_by(self.files_tbl.c.id)
                     .offset(offset)
@@ -993,8 +1015,9 @@ class MigrateJob:
 
         self.disable_checksums = args.disable_checksums
         self.preserve_timestamps = args.preserve_timestamps
-        # self.vvs_per_job = args.vvs_per_job
-        self.vvs_per_job = 1
+        self.parallel_migration_count = args.parallel_migration_count
+        self.vvs_per_job = args.vvs_per_job
+        # self.parallel_migration_count = 1
         self.addl_flags = args.additional_hsi_flags
         self.overwrite = args.overwrite_existing
         self.disable_ta = args.disable_ta
@@ -1106,49 +1129,43 @@ class MigrateJob:
             DATABASE.setsrcchecksum(path, hashlistout[path])
             DATABASE.markfileashpsschecksumcomplete(path)
 
+    
+    def chunk(self, lst, chunksize) -> list:
+        if chunksize < 0 and chunksize != -1:
+            LOGGER.critical(
+                "parallel-migration-count needs to be either -1 or a positive integer!"
+            )
+            cleanup_and_die(4)
+        if chunksize == -1:
+            yield [ l[0] for l in lst ]
+        for i in range(0, len(lst), chunksize):
+            yield [ l[0] for l in lst[i : i + chunksize] ]
+
     # This is the main migration thread! All the fun stuff happens here
     # - Generates the file lists
     # - Calls HSI to migrate and hash files
     # - Populate the db with the resulting information
     # - Profit
-    def startMigrate(self):
-        # Generator to created a chunked list of vv's
-        def chunk(lst, chunksize):
-            if chunksize < 0 and chunksize != -1:
-                LOGGER.critical(
-                    "vvs-per-job needs to be either -1 or a positive integer!"
-                )
-                cleanup_and_die(4)
-            if chunksize == -1:
-                yield lst
-            for i in range(0, len(lst), chunksize):
-                yield lst[i : i + chunksize]
 
+    def generateFileList(self) -> (str, list):
         # Get chunked list of vvs
         allvvs = DATABASE.getvvswithnoncompletefiles()
 
-        # TODO: This may be a problem, if we use --vvs-per-job > 1
-        vvs = list(chunk(allvvs, int(self.vvs_per_job)))
+        vvs = list(self.chunk(allvvs, int(self.vvs_per_job)))
 
-        # TODO: Adding this below to ensure that we get ALL chunks; UNTESTED
-        # if len(vvs) > len(allvvs):
-        #    vvs = []
-        #    for lst in chunk(allvvs, int(self.vvs_per_job)):
-        #        vvs.append(list(lst))
-
-        LOGGER.info(f"Will generate {len(vvs)} file lists", extra={"block": "cli"})
+        LOGGER.info(f"Will generate {math.ceil(len(vvs)/self.parallel_migration_count)} file lists", extra={"block": "cli"})
 
         # Get list of exisitng files from the db
-        existingFiles = DATABASE.getexistingfiles()
+        self.existingFiles = DATABASE.getexistingfiles()
 
         if self.overwrite:
-            existingFiles = []
+            self.existingFiles = []
 
-        if len(existingFiles) > 0:
+        if len(self.existingFiles) > 0:
             LOGGER.debug("Found existing files:")
             # Format existingFiles so it looks better
             existing = []
-            for f in existingFiles:
+            for f in self.existingFiles:
                 existing.append({"source": f[0], "destination": f[1]})
             LOGGER.debug(json.dumps(existing, indent=2))
 
@@ -1156,10 +1173,9 @@ class MigrateJob:
 
         # Set some variables for status output (esp if not using the progress bar)
         filelistnum = 0
-        filesCompleted = len(existingFiles)
-        filesTotal = DATABASE.gettotalnumberoffiles()[0]
+        self.filesCompleted += len(self.existingFiles)
         LOGGER.info(
-            f"Will transfer {filesTotal} files from HPSS", extra={"block": "cli"}
+            f"Will transfer {self.filesTotal} files from HPSS", extra={"block": "cli"}
         )
 
         # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
@@ -1167,199 +1183,211 @@ class MigrateJob:
 
         # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
         DATABASE.update_state(filelist_count=len(vvs))
-        first_iter = True
 
         for vvlist in vvs:
             files = []
-            # Unpack chunk. Will generally just be a list of 1 vvid, but in case --vvs-per-job is set, this will chunk it up
-            for vv in vvlist:
-                filelistnum += 1
-                tmpgetfilename = os.path.join(
-                    self.filelists_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
-                )
-                tmphashfilename = os.path.join(
-                    self.filelists_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
-                )
-                infilename = os.path.join(
-                    self.filelists_path, f"hsi_xfer.{filelistnum}.list"
-                )
-                with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(
-                    tmphashfilename, "a", encoding="UTF-8"
+            allfilesinlist = []
+            filelistnum += 1
+            tmpgetfilename = os.path.join(
+                self.filelists_path, f"hpss_tsf_tmp_get.{filelistnum}.list"
+            )
+            tmphashfilename = os.path.join(
+                self.filelists_path, f"hpss_tsf_tmp_hash.{filelistnum}.list"
+            )
+            infilename = os.path.join(
+                self.filelists_path, f"hsi_xfer.{filelistnum}.list"
+            )
+            with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(
+                tmphashfilename, "a", encoding="UTF-8"
+            ) as hashfile:
+                for chunk in DATABASE.getfilesbyvvlist(vvlist):
+                    files = chunk
+                    files = [f for f in files if f not in self.existingFiles]
+                    allfilesinlist.extend(files)
+
+                    # We're going to be writing multiple gets and hashcreate commands here
+                    # Write each to a separate file, and append to infile at the end?
+                    if len(files) > 0:
+                        LOGGER.debug(
+                            "Writing list of %s files to temporary file list...",
+                            len(chunk),
+                        )
+
+                        # Do a hashlist to get files that have hashes already
+                        hashlistout = self.runHashList(files, filelistnum)
+                        # if file has hash; save to db
+                        self.writeExistingHashes(hashlistout)
+                        # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
+                        to_hash = [f for f in files if f[0] not in hashlistout]
+
+                        getfile.write(
+                            "\n".join(["{} : {}".format(sanitize(f[1]), sanitize(f[0])) for f in files])
+                        )
+                        getfile.write("\n")
+                        # Add a hashcreate command to generate and get hashes in the same job.
+                        # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
+                        # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
+                        if not self.disable_checksums and len(to_hash) > 0:
+                            hashfile.write(
+                                "\n".join(["{}".format(sanitize(f[0])) for f in to_hash])
+                            )
+                            hashfile.write("\n")
+
+            if len(allfilesinlist) > 0:
+                # Get the length of the hashfiles
+                hashfilelen = 0
+                with open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
+                    hashfilelen = sum(1 for _ in hashfile)
+
+                # Combine both the hashfile and getfile here
+                with open(infilename, "w", encoding="UTF-8") as infile, open(
+                    tmpgetfilename, "r", encoding="UTF-8"
+                ) as getfile, open(
+                    tmphashfilename, "r", encoding="UTF-8"
                 ) as hashfile:
-                    for chunk in DATABASE.getfilesbyvv(vv[0]):
-                        files = chunk
-                        files = [f for f in files if f not in existingFiles]
+                    LOGGER.debug("Combining temporary file lists")
+                    # Write the infile to be passed into HSI
+                    getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T on << EOF\n"
+                    if self.disable_ta:
+                        getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T off << EOF\n"
 
-                        # TODO: Ensure that this does not kill performance
-                        # We're going to be writing multiple gets and hashcreate commands here
-                        # Write each to a separate file, and append to infile at the end?
-                        if len(files) > 0:
-                            LOGGER.debug(
-                                "Writing list of %s files to temporary file list...",
-                                len(chunk),
+                    # hashcreate can not use the TA, so we force -T off
+                    hashcreatecmd = "hashcreate -T off << EOF\n"
+                    infile.write(getcmd)
+                    for line in getfile:
+                        infile.write(line)
+                    infile.write("EOF\n")
+                    if not self.disable_checksums and hashfilelen > 0:
+                        infile.write(hashcreatecmd)
+                        for hashline in hashfile:
+                            infile.write(hashline)
+                        infile.write("EOF")
+
+                # Remove our tmp files
+                LOGGER.debug("Removing temporary file lists")
+                os.remove(tmphashfilename)
+                os.remove(tmpgetfilename)
+                yield (infilename, allfilesinlist)
+
+    # Does a single hsi migration
+    def doFilelistMigration(self, infilename, files) -> int:
+        if os.path.exists(infilename):
+            # This is our HSI job
+            migration_job = HSIJob(
+                self.hsi,
+                self.addl_flags,
+                True,
+                self.verbose,
+                "in {}".format(infilename),
+            )
+            if not self.dry_run:
+                for f in files:
+                    DATABASE.markfileasstaging(f[2])
+                # Run the job!
+                # Scan through the output looking for errors and md5 sums. Populate the db accordingly
+                last_notif_time = int(time.time())
+                last_notif_idx = 0
+                # TODO: Launch multiple threads for the below block
+                for chunk in migration_job.run(continueOnFailure=True):
+                    for line in chunk:
+                        # Log output to syslog every 10% of total or if its the first iteration
+
+                        if "(md5)" in line:
+                            checksum, srcpath = (
+                                line.split(" ")[0],
+                                line.split(" ")[-1],
                             )
+                            DATABASE.setsrcchecksum(srcpath, checksum)
+                            DATABASE.markfileashpsschecksumcomplete(srcpath)
 
-                            # Do a hashlist to get files that have hashes already
-                            hashlistout = self.runHashList(files, filelistnum)
-                            # if file has hash; save to db
-                            self.writeExistingHashes(hashlistout)
-                            # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
-                            to_hash = [f for f in files if f[0] not in hashlistout]
+                        matches = re.match(
+                            r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?",
+                            line,
+                        )
+                        if matches:
+                            srcpath = matches.group(2)
+                            self.filesCompleted += 1
+                            DATABASE.markfileastransfercompleted(srcpath)
 
-                            getfile.write(
-                                "\n".join(["{} : {}".format(sanitize(f[1]), sanitize(f[0])) for f in files])
+                        if "get: Error" in line:
+                            LOGGER.error(
+                                "File %s failed to transfer from HPSS",
+                                line.split(" ")[-1],
                             )
-                            getfile.write("\n")
-                            # Add a hashcreate command to generate and get hashes in the same job.
-                            # We're not doing this in parallel here, since it'll create a lot of PASSCODE prompts if a user isn't using keytabs
-                            # And since they both (get and hashcreate) need to stage the data, we're not introducing too much extra runtime here
-                            if not self.disable_checksums and len(to_hash) > 0:
-                                hashfile.write(
-                                    "\n".join(["{}".format(sanitize(f[0])) for f in to_hash])
-                                )
-                                hashfile.write("\n")
-
-                if len(files) > 0:
-                    # Get the length of the hashfiles
-                    hashfilelen = 0
-                    with open(tmphashfilename, "r", encoding="UTF-8") as hashfile:
-                        hashfilelen = sum(1 for _ in hashfile)
-
-                    # Combine both the hashfile and getfile here
-                    with open(infilename, "w", encoding="UTF-8") as infile, open(
-                        tmpgetfilename, "r", encoding="UTF-8"
-                    ) as getfile, open(
-                        tmphashfilename, "r", encoding="UTF-8"
-                    ) as hashfile:
-                        LOGGER.debug("Combining temporary file lists")
-                        # Write the infile to be passed into HSI
-                        getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T on << EOF\n"
-                        if self.disable_ta:
-                            getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T off << EOF\n"
-
-                        # hashcreate can not use the TA, so we force -T off
-                        hashcreatecmd = "hashcreate -T off << EOF\n"
-                        infile.write(getcmd)
-                        for line in getfile:
-                            infile.write(line)
-                        infile.write("EOF\n")
-                        if not self.disable_checksums and hashfilelen > 0:
-                            infile.write(hashcreatecmd)
-                            for hashline in hashfile:
-                                infile.write(hashline)
-                            infile.write("EOF")
-
-                    # Remove our tmp files
-                    LOGGER.debug("Removing temporary file lists")
-                    os.remove(tmphashfilename)
-                    os.remove(tmpgetfilename)
-
-                    # This is our HSI job
-                    migration_job = HSIJob(
-                        self.hsi,
-                        self.addl_flags,
-                        True,
-                        self.verbose,
-                        "in {}".format(infilename),
-                    )
-                    if first_iter:
-                        LOGGER.info(
-                            "Launching a sorted batch migration of files from %s to %s (dry-run=%s)",
-                            self.source,
-                            self.destination,
-                            self.dry_run,
-                        )
-                    if not self.dry_run:
-                        for f in files:
-                            DATABASE.markfileasstaging(f[2])
-                        # Run the job!
-                        # Scan through the output looking for errors and md5 sums. Populate the db accordingly
-                        last_notif_time = int(time.time())
-                        last_notif_idx = 0
-                        for chunk in migration_job.run(continueOnFailure=True):
-                            for line in chunk:
-                                # Log output to the user every 30s or if its the first iteration
-                                now = int(time.time())
-                                if ((now - last_notif_time) >= 60) or (
-                                    first_iter is True
-                                ):
-                                    first_iter = False
-                                    last_notif_time = now
-                                    LOGGER.info(
-                                        "%s/%s file transfers have been attempted",
-                                        filesCompleted,
-                                        filesTotal,
-                                        extra={"block": "syslog"},
-                                    )
-                                # Log output to syslog every 10% of total or if its the first iteration
-                                if (
-                                    (filesCompleted / filesTotal * 100) % 10 == 0
-                                    and last_notif_idx != filesCompleted
-                                ) or (first_iter is True):
-                                    first_iter = False
-                                    last_notif_idx = filesCompleted
-                                    payload = {
-                                        "filescompleted": filesCompleted,
-                                        "filestotal": filesTotal,
-                                    }
-                                    LOGGER.info(
-                                        json.dumps(payload),
-                                        extra={"block": "cli"},
-                                    )
-
-                                if "(md5)" in line:
-                                    checksum, srcpath = (
-                                        line.split(" ")[0],
-                                        line.split(" ")[-1],
-                                    )
-                                    DATABASE.setsrcchecksum(srcpath, checksum)
-                                    DATABASE.markfileashpsschecksumcomplete(srcpath)
-
-                                matches = re.match(
-                                    r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?",
-                                    line,
-                                )
-                                if matches:
-                                    srcpath = matches.group(2)
-                                    filesCompleted += 1
-                                    LOGGER.debug(
-                                        "Processed (%s/%s) files: %s",
-                                        filesCompleted,
-                                        filesTotal,
-                                        srcpath,
-                                    )
-                                    DATABASE.markfileastransfercompleted(srcpath)
-
-                                if "get: Error" in line:
-                                    LOGGER.error(
-                                        "File %s failed to transfer from HPSS",
-                                        line.split(" ")[-1],
-                                    )
-                                    DATABASE.markasfailed(line.split(" ")[-1])
-                        # Log the last notifications
-                        LOGGER.info(
-                            "%s/%s file transfers have been attempted",
-                            filesCompleted,
-                            filesTotal,
-                            extra={"block": "syslog"},
-                        )
-                        payload = {
-                            "filescompleted": filesCompleted,
-                            "filestotal": filesTotal,
-                        }
-                        LOGGER.info(json.dumps(payload), extra={"block": "cli"})
-                        PROFILER.snapshot()
-                    else:
-                        LOGGER.info("Would have run: %s", migration_job.getcommand())
-                else:
-                    LOGGER.debug(
-                        "Skipping file list due to existing files. Use --overwrite-existing to bypass this"
-                    )
+                            DATABASE.markasfailed(line.split(" ")[-1])
+                # Log the last notifications
+                # TODO: This will only notify at the end of a filelist; make this more granular
+                LOGGER.info(
+                    "%s/%s file transfers have been attempted",
+                    self.filesCompleted,
+                    self.filesTotal,
+                    extra={"block": "syslog"},
+                )
+                payload = {
+                    "filescompleted": self.filesCompleted,
+                    "filestotal": self.filesTotal,
+                }
+                LOGGER.info(json.dumps(payload), extra={"block": "cli"})
+            else:
+                LOGGER.info("Would have run: %s", migration_job.getcommand())
+        else:
+            LOGGER.debug(
+                "Skipping file list due to existing files. Use --overwrite-existing to bypass this"
+            )
         return 0
+
+    # HPSS/HSI is configured such that we can't rely on HSI to parallelize anything here
+    def startMigrate(self) -> int:
+        # Generator to created a chunked list of vv's
+        self.filesTotal = DATABASE.gettotalnumberoffiles()[0]
+        self.filesCompleted = 0
+        LOGGER.info(
+            "Launching a sorted batch migration of %d files from %s to %s (dry-run=%s)",
+            self.filesTotal,
+            self.source,
+            self.destination,
+            self.dry_run,
+        )
+        threads = []
+        numfilelists = math.ceil(DATABASE.gettotalnumberofvvs()[0] / self.vvs_per_job)
+        flists = self.generateFileList()
+        for vvnum in range(0, numfilelists):
+            # Generate the next file list and list of files
+            infilename, files = next(flists)
+            #If active threads is < the number of parallel executions allowed, create a new thread
+            if len(threads) < self.parallel_migration_count:
+                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                thread = threading.Thread(target=self.doFilelistMigration, args=(infilename, files))
+                thread.start()
+                threads.append(thread)
+            else:
+                # If we're out of free threads, poll the threads every second to see if any have died
+                while len(threads) >= self.parallel_migration_count:
+                    time.sleep(1)
+                    threads = [ t for t in threads if t.is_alive() ]
+
+                if len(threads) >= self.parallel_migration_count:
+                    LOGGER.error("Undefined behavior: too many threads")
+                    cleanup_and_die(100)
+
+                # Once theres space, add a new thread and continue
+                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                thread = threading.Thread(target=self.doFilelistMigration, args=(infilename, files))
+                thread.start()
+                threads.append(thread)
+
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+
+        return 0
+
 
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
     # We're defaulting to a 4 thread pool for checksumming. This can be overwritten by --checksum-threads
+    # TODO: Modify this such that it runs during transfers. Use an async function?
     def startDestChecksumming(self):
+        LOGGER.info("Starting checksumming of transferred files")
         files = DATABASE.getnonfailedsrcchecksumfiles()
         values = []
         with Pool(self.checksum_threads) as p:
@@ -1487,8 +1515,10 @@ class MigrateJob:
             cur = start
             for chunk in self.ls_job.run():
                 LOGGER.debug(
-                    f"Got {len(chunk)} files from HSI. Retrival took {int(time.time())-cur}s"
+                    f"Got {len(chunk)} entries from HSI. Retrival took {int(time.time())-cur}s"
                 )
+                LOGGER.debug(f"{chunk}")
+
                 files = []
                 dirs = set()
 
@@ -1861,7 +1891,6 @@ def main():
         type=str,
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
-    # parser.add_argument("--vvs-per-job", help=argparse.SUPPRESS, default=1, type=int)
     parser.add_argument(
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
     )
@@ -1875,7 +1904,13 @@ def main():
         "-s", "--db-tx-size", help=argparse.SUPPRESS, default=9000, type=int
     )
     parser.add_argument(
-        "-t", "--trace", default=False, help=argparse.SUPPRESS, action="store_true"
+        "-r", "--trace", default=False, help=argparse.SUPPRESS, action="store_true"
+    )
+    parser.add_argument(
+        "-V", "--vvs-per-job", default=VVS_PER_JOB, help=argparse.SUPPRESS, type=int
+    )
+    parser.add_argument(
+        "-t", "--parallel-migration-count", default=MIGRATION_THREADS, help=argparse.SUPPRESS, type=int
     )
     parser.add_argument(
         "-v",
@@ -1890,16 +1925,17 @@ def main():
 
     initLogger(args.verbose)
 
-    # if args.vvs_per_job != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
+    # if args.parallel_migration_count != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
     if (
         args.debug
         or args.disable_ta
         or args.db_tx_size != 9000
         or args.trace
         or args.checksum_threads != 4
+        or args.parallel_migration_count != VVS_PER_JOB
     ):
         LOGGER.error("Hidden flag usage detected", extra={"block": "cli"})
-        # LOGGER.error(f"Flag: --vvs-per-job={args.vvs_per_job}", extra={'block':'cli'})
+        LOGGER.error(f"Flag: --parallel-migration-count={args.parallel_migration_count}", extra={'block':'cli'})
         LOGGER.error(
             f"Flag: --checksum-threads={args.checksum_threads}", extra={"block": "cli"}
         )
@@ -1959,14 +1995,7 @@ def main():
         LOGGER.info("Creating destination directory structure")
         job.createDestTree()
 
-    # Create our main threads here. One for migration, the other for checksumming
-    migrateThread = threading.Thread(target=job.startMigrate)
-    destchecksumThread = threading.Thread(target=job.startDestChecksumming)
-
-    # Start migrating files
-    migrateThread.start()
-    # Wait until migration is done
-    migrateThread.join()
+    job.startMigrate()
 
     # Start checksumming destination files
     # TODO: Can we overlap these threads at some point?
@@ -1974,9 +2003,7 @@ def main():
     report = {}
     global DYING
     if not args.dry_run and not args.disable_checksums:
-        destchecksumThread.start()
-        # Wait for checksumming to finish. If you wanna do more things, do them here?
-        destchecksumThread.join()
+        job.startDestChecksumming()
         # Generate our report
         report = job.checksumMismatchReport()
 
