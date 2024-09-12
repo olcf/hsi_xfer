@@ -1017,6 +1017,7 @@ class MigrateJob:
         self.preserve_timestamps = args.preserve_timestamps
         self.parallel_migration_count = args.parallel_migration_count
         self.vvs_per_job = args.vvs_per_job
+        self.update_interval = args.update_interval
         # self.parallel_migration_count = 1
         self.addl_flags = args.additional_hsi_flags
         self.overwrite = args.overwrite_existing
@@ -1338,8 +1339,22 @@ class MigrateJob:
             )
         return 0
 
+    def _outputstatus(self):
+        LOGGER.info(
+            "%s/%s file transfers have been attempted",
+            self.filesCompleted,
+            self.filesTotal,
+            extra={"block": "syslog"},
+        )
+
     # HPSS/HSI is configured such that we can't rely on HSI to parallelize anything here
     def startMigrate(self) -> int:
+        _stoptimer = False
+        def StartOutputTimer(interval, output):
+            while _stoptimer is False:
+                output()
+                time.sleep(interval)
+
         # Generator to created a chunked list of vv's
         self.filesTotal = DATABASE.gettotalnumberoffiles()[0]
         self.filesCompleted = 0
@@ -1350,6 +1365,11 @@ class MigrateJob:
             self.destination,
             self.dry_run,
         )
+
+        # This will output a status message every self.update_interval seconds (--update-interval)
+        outputer = threading.Thread(target=StartOutputTimer, args=(self.update_interval, self._outputstatus))
+        outputer.start()
+
         threads = []
         numfilelists = math.ceil(DATABASE.gettotalnumberofvvs()[0] / self.vvs_per_job)
         flists = self.generateFileList()
@@ -1381,6 +1401,8 @@ class MigrateJob:
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
+
+        _stoptimer = True
 
         return 0
 
@@ -1888,6 +1910,13 @@ def main():
         default=os.getcwd(),
         type=str,
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
+    )
+    parser.add_argument(
+        "-i",
+        "--update-interval",
+        default=300,
+        type=int,
+        help="Sets the interval between status updates during file transfers",
     )
     parser.add_argument(
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
