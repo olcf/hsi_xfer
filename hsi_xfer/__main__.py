@@ -4,6 +4,7 @@
 
 import argparse
 import math
+import mmap
 import fcntl
 import getpass
 import socket
@@ -149,13 +150,24 @@ class CustomFormatter(logging.Formatter):
     formaterror = "\r[-] %(message)s"
     formatwarning = "\r[-] %(message)s"
 
-    FORMATS = {
-        logging.DEBUG: grey + formatdebug + reset,
-        logging.INFO: green + formatinfo + reset,
-        logging.WARNING: yellow + formatwarning + reset,
-        logging.ERROR: red + formaterror + reset,
-        logging.CRITICAL: bold_red + formatcritical + reset,
-    }
+
+    def __init__(self, timestamps_enable):
+        super().__init__()
+        if timestamps_enable:
+            self.DATEFMT = '%Y-%m-%d %H:%M:%S'
+            self.formatdebug = "\r%(asctime)s [%(levelname)s] %(message)s"
+            self.formatinfo = "\r%(asctime)s [+] %(message)s"
+            self.formatcritical = "\r%(asctime)s [!] %(message)s"
+            self.formaterror = "\r%(asctime)s [-] %(message)s"
+            self.formatwarning = "\r%(asctime)s [-] %(message)s"
+
+        self.FORMATS = {
+            logging.DEBUG: self.grey + self.formatdebug + self.reset,
+            logging.INFO: self.green + self.formatinfo + self.reset,
+            logging.WARNING: self.yellow + self.formatwarning + self.reset,
+            logging.ERROR: self.red + self.formaterror + self.reset,
+            logging.CRITICAL: self.bold_red + self.formatcritical + self.reset,
+        }
 
     def format(self, record):
         log_fmt = self.FORMATS.get(record.levelno)
@@ -1024,6 +1036,8 @@ class MigrateJob:
         self.disable_ta = args.disable_ta
         self.checksum_threads = args.checksum_threads
         self.hsi = "/sw/sources/hpss/bin/hsi"
+        self.indexedFilesComplete = 0
+        self.indexedDirsComplete = 0
 
         self.relative_input_source = (
             f"./{os.path.normpath(args.source)}"
@@ -1198,6 +1212,32 @@ class MigrateJob:
             infilename = os.path.join(
                 self.filelists_path, f"hsi_xfer.{filelistnum}.list"
             )
+            # Check if infile exists and the tmp files don't. If tmp files exist, we can assume that it died while writing the temp files. If it does, then a cache was probably passed in
+            if os.path.exists(infilename) and not os.path.exists(tmpgetfilename) and not os.path.exists(tmphashfilename):
+                # Generate our list of files from the db. Probably faster to read the infile, but this is easier
+                for chunk in DATABASE.getfilesbyvvlist(vvlist):
+                    allfilesinlist.extend([f for f in chunk if f not in self.existingFiles])
+
+                if len(allfilesinlist) > 0:
+                    LOGGER.info(f"Found existing filelist {infilename}, attempting to use as-is")
+                    yield infilename, allfilesinlist
+                    continue
+                else:
+                    LOGGER.info(f"Found exisiting filelist {infilename}, but it is unusable. Regenerating...")
+                    files = []
+                    allfilesinlist = []
+                    os.remove(infilename)
+                    try:
+                        os.remove(tmphashfilename)
+                        os.remove(tmpgetfilename)
+                    except OSError as e:
+                        if e.errno != errno.ENOENT:
+                            LOGGER.error(f"Could not remove existing temp file lists. Please try again without --cache-path")
+                            cleanup_and_die(201)
+                        else:
+                            pass
+
+
             with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(
                 tmphashfilename, "a", encoding="UTF-8"
             ) as hashfile:
@@ -1339,6 +1379,8 @@ class MigrateJob:
             )
         return 0
 
+        _stoptimer = False
+
     def _outputstatus(self):
         LOGGER.info(
             "%s/%s file transfers have been attempted",
@@ -1410,6 +1452,7 @@ class MigrateJob:
     # This is our main destination checksumming thread. This will be pretty fast b/c GPFS.
     # We're defaulting to a 4 thread pool for checksumming. This can be overwritten by --checksum-threads
     # TODO: Modify this such that it runs during transfers. Use an async function?
+    # TODO: Add outputtimer here too
     def startDestChecksumming(self):
         LOGGER.info("Starting checksumming of transferred files")
         files = DATABASE.getnonfailedsrcchecksumfiles()
@@ -1529,12 +1572,35 @@ class MigrateJob:
         # Last ditch effort, just basically do _hpss_root_dir on path
         return path
 
+    def _outputindexingstatus(self):
+        LOGGER.info(
+            "%s files and %s directories have been indexed",
+            self.indexedFilesComplete,
+            self.indexedDirsComplete,
+            extra={"block": "syslog"},
+        )
     # This gets the list of files from HPSS to be inserted into the DB
     def getSrcFiles(self):
+        _stoptimer = False
+        def _startoutputtimer(interval, output):
+            while _stoptimer is False:
+                output()
+                time.sleep(interval)
+
+        # TODO: Copy the outputtimer stuff here and use it so its not just sitting for a long time
         if not DATABASE.get_state().indexing_complete:
             start = int(time.time())
             cur = start
+
+            # Start the output timer
+            t = threading.Thread(target=_startoutputtimer, args=(self.update_interval, self._outputindexingstatus))
+
             for chunk in self.ls_job.run():
+                # Just so we don't output a bunch of '0 files indexed' messages while the `ls` is getting the first batch,
+                # Wait to start the thread until the first batch of files have been returned from the generator
+                if not t.is_alive() and _stoptimer is False:
+                    t.start()
+
                 LOGGER.debug(
                     f"Got {len(chunk)} entries from HSI. Retrival took {int(time.time())-cur}s"
                 )
@@ -1551,11 +1617,13 @@ class MigrateJob:
                         file, size, vv = s[1], s[2], s[5]
                         files.append((file, vv, size))
                         dirs.add(os.path.dirname(file))
+                        self.indexedFilesComplete += 1
+                        self.indexedDirsComplete = len(dirs)
                 LOGGER.debug(f"Chunk processing took {int(time.time())-pstart}s")
 
                 dstart = int(time.time())
                 # Removing junk from array
-                dirs = [
+                dirs = {
                     DestTree(
                         created=False,
                         path=d.replace(self._hpss_root_dir, self.destination, 1),
@@ -1563,10 +1631,11 @@ class MigrateJob:
                     for d in dirs
                     if d.replace(self._hpss_root_dir, self.destination, 1)
                     not in DATABASE.desttrees
-                ]
+                }
+                self.indexedDirsComplete = len(dirs)
                 # Adding the root destination since files can be at depth 0, and we want to make sure its there
                 if self.destination not in DATABASE.desttrees:
-                    dirs.append(DestTree(created=False, path=self.destination))
+                    dirs.add(DestTree(created=False, path=self.destination))
                 if len(dirs) > 0:
                     DATABASE.insertdesttree(dirs)
                 if len(files) > 0:
@@ -1581,12 +1650,12 @@ class MigrateJob:
                 LOGGER.critical(
                     f"No files found on HPSS matching query ({self.source}) or all files matched already exist in {self.destination}"
                 )
-                LOGGER.critical(
-                    f"Use --overwrite-existing to overwrite files in the destination directory"
-                )
+                _stoptimer = True
                 cleanup_and_die(119)
+            self._outputindexingstatus()
         else:
             LOGGER.info("Skipping file indexing due to input cache")
+        _stoptimer = True
         PROFILER.snapshot()
 
 
@@ -1764,13 +1833,13 @@ def initPrelogger():
 
     cliHandler = logging.StreamHandler()
     cliHandler.setLevel(loglevel)
-    cliHandler.setFormatter(CustomFormatter())
+    cliHandler.setFormatter(CustomFormatter(False))
     cliHandler.name = "preCliHandler"
     cliHandler.addFilter(handler_filter("pre"))
     LOGGER.addHandler(cliHandler)
 
 
-def initLogger(verbose):
+def initLogger(verbose, enable_timestamps):
     global LOGGER
     LOGGER = None
 
@@ -1785,7 +1854,7 @@ def initLogger(verbose):
 
     cliHandler = logging.StreamHandler()
     cliHandler.setLevel(loglevel)
-    cliHandler.setFormatter(CustomFormatter())
+    cliHandler.setFormatter(CustomFormatter(enable_timestamps))
     cliHandler.name = "cliHandler"
     cliHandler.addFilter(handler_filter("cli"))
 
@@ -1912,6 +1981,13 @@ def main():
         help="Sets the path that the transfer report and/or database/file list are written to. This can be useful if the DB and resulting files lists/transfer report are too large for your current working directory",
     )
     parser.add_argument(
+        "-E",
+        "--enable-log-timestamps",
+        default=False,
+        action="store_true",
+        help="Turn on log timestamps for status output",
+    )
+    parser.add_argument(
         "-i",
         "--update-interval",
         default=300,
@@ -1950,7 +2026,7 @@ def main():
     # Get our cli args
     args = parser.parse_args()
 
-    initLogger(args.verbose)
+    initLogger(args.verbose, args.enable_log_timestamps)
 
     # if args.parallel_migration_count != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
     if (
