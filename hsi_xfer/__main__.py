@@ -1031,6 +1031,7 @@ class MigrateJob:
         self.hsi = "/sw/sources/hpss/bin/hsi"
         self.indexedFilesComplete = 0
         self.indexedDirsComplete = 0
+        self.elapsedTransferTime = 0
 
         self.relative_input_source = (
             f"./{os.path.normpath(args.source)}"
@@ -1338,6 +1339,7 @@ class MigrateJob:
                 self.verbose,
                 "in {}".format(infilename),
             )
+            elapsedtime = 0
             if not self.dry_run:
                 for f in files:
                     DATABASE.markfileasstaging(f[2])
@@ -1412,6 +1414,7 @@ class MigrateJob:
                 output()
                 time.sleep(interval)
 
+        starttime = int(time.time())
         # Generator to created a chunked list of vv's
         self.filesTotal = DATABASE.gettotalnumberoffiles()[0]
         self.filesCompleted = 0
@@ -1431,10 +1434,11 @@ class MigrateJob:
 
         threads = []
         numfilelists = math.ceil(DATABASE.gettotalnumberofvvs()[0] / self.vvs_per_job)
-        flists = self.generateFileList()
-        for vvnum in range(0, numfilelists):
-            # Generate the next file list and list of files
-            infilename, files = next(flists)
+       # flists = self.generateFileList()
+       # for vvnum in range(0, numfilelists):
+       #     # Generate the next file list and list of files
+       #     infilename, files = next(flists)
+        for infilename, files in self.generateFileList():
             # If active threads is < the number of parallel executions allowed, create a new thread
             if len(threads) < self.parallel_migration_count:
                 LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
@@ -1465,9 +1469,14 @@ class MigrateJob:
         for thread in threads:
             thread.join()
 
+        endtime = int(time.time())
+        self.elapsedTransferTime = (endtime - starttime)
         _stoptimer = True
 
         return 0
+
+    def getAverageTransferSpeed(self, totalsize):
+        return ((totalsize / 1000 / 1000) / self.elapsedTransferTime)
 
     def _outputdestchecksumstatus(self):
         LOGGER.info(
@@ -1624,8 +1633,8 @@ class MigrateJob:
             endtime = int(time.time())
             # Default to 1 second elapsed here just to prevent divide by zero
             elapsed = (endtime - starttime) if (endtime - starttime) > 0 else 1
-            bps = (totalsize / 1000 / 1000) / elapsed
-            report["average_speed"] = bps
+            #bps = (totalsize / 1000 / 1000) / elapsed
+            report["average_speed"] = self.getAverageTransferSpeed(totalsize)
             report["elapsed_time"] = elapsed
             report["total_size_in_bytes"] = totalsize
 
