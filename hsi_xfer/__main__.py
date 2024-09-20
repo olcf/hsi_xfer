@@ -122,6 +122,7 @@ class LockFile:
 
     def cleanup(self):
         self.unlock()
+        LOGGER.debug("Cleaned up Lockfile", extra={"block": "syslog"})
 
     def fail(self, delete_lockfile=True):
         LOGGER.error(
@@ -300,13 +301,16 @@ class Cache:
     def cleanup(self):
         if self.cleanup_filelists and self.cleanup_db:
             shutil.rmtree(self.archive_path)
+            LOGGER.debug("Finished cache cleanup", extra={"block": "syslog"})
             return
         elif self.cleanup_filelists and not self.cleanup_db:
             shutil.rmtree(self.filelists_root_path)
         elif self.cleanup_db and not self.cleanup_filelists:
             os.remove(self.dbpath)
             shutil.move(self.filelists_root_path, self.cache_parent_path)
+        LOGGER.debug("Packing Cache", extra={"block": "syslog"})
         self.pack()
+        LOGGER.debug("Finished cache cleanup", extra={"block": "syslog"})
 
     def caught_exception(self):
         self.cleanup_filelists = False
@@ -415,8 +419,8 @@ class Database:
         self.init_state_tbl()
 
     def cleanup(self):
-        LOGGER.debug("Killing DB connection")
         self.engine.dispose()
+        LOGGER.debug("Closed DB connection")
 
     def __del__(self):
         self.engine.dispose()
@@ -1409,7 +1413,7 @@ class MigrateJob:
     def startMigrate(self) -> int:
         _stoptimer = False
 
-        def StartOutputTimer(interval, output):
+        def _startoutputtimer(interval, output):
             while _stoptimer is False:
                 output()
                 time.sleep(interval)
@@ -1428,8 +1432,9 @@ class MigrateJob:
 
         # This will output a status message every self.update_interval seconds (--update-interval)
         outputer = threading.Thread(
-            target=StartOutputTimer, args=(self.update_interval, self._outputstatus)
+            target=_startoutputtimer, args=(self.update_interval, self._outputstatus)
         )
+        outputer.daemon = True
         outputer.start()
 
         threads = []
@@ -1548,6 +1553,7 @@ class MigrateJob:
             target=_startoutputtimer,
             args=(self.update_interval, self._outputdestchecksumstatus),
         )
+        outputer.daemon = True
         outputer.start()
 
         files = DATABASE.getnonfailedsrcchecksumfiles()
@@ -1706,6 +1712,7 @@ class MigrateJob:
                 target=_startoutputtimer,
                 args=(self.update_interval, self._outputindexingstatus),
             )
+            t.daemon = True
 
             for chunk in self.ls_job.run():
                 # Just so we don't output a bunch of '0 files indexed' messages while the `ls` is getting the first batch,
@@ -2220,6 +2227,8 @@ def main():
     DATABASE.cleanup()
     CACHE.cleanup()
     LOCKFILE.cleanup()
+    LOGGER.debug("Finished all cleanups", extra={"block": "syslog"})
+    return 0
 
 
 def __handle_sigs(signum, frame):
@@ -2274,6 +2283,7 @@ def entrypoint():
         # Can we get a lockfile and if not, error and exit
         LOCKFILE.lock()
         sys.exit(main())
+        LOGGER.debug("exited main", extra={"block": "syslog"})
 
     # Ctrl+c will trigger the signal handler, further Ctrl+c will trigger this exception handler
     except Exception as e:
