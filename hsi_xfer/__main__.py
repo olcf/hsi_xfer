@@ -1481,7 +1481,10 @@ class MigrateJob:
         return 0
 
     def getAverageTransferSpeed(self, totalsize):
-        return ((totalsize / 1000 / 1000) / self.elapsedTransferTime)
+        if self.elapsedTransferTime > 0:
+            return ((totalsize / 1000 / 1000) / self.elapsedTransferTime)
+        else:
+            return 0
 
     def _outputdestchecksumstatus(self):
         LOGGER.info(
