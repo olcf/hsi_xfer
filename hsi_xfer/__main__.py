@@ -1070,11 +1070,11 @@ class MigrateJob:
             for file in files:
                 destpath = file[0].dest
                 fileid = file[0].id
-                destsize = file[0].sizebytes
+                srcsize = file[0].sizebytes
                 # Check if file exists in the destination. If it does exist, check if the file sizes are the same. If they're different
                 # Assume that the file is incomplete and overwrite it
                 if os.path.isfile(destpath):
-                    srcsize = os.path.getsize(destpath)
+                    destsize = os.path.getsize(destpath)
                     if srcsize == destsize:
                         # Check if indexing complete, and if so, check if the file is 'staging', then do not add, else, mark exists
                         LOGGER.debug(
