@@ -403,6 +403,7 @@ class Database:
         try:
             self.engine = create_engine(f"sqlite:///{self.dbpath}", echo=self.debug)
             Base.metadata.create_all(self.engine)
+            LOGGER.debug(f"Connected to database: {self.dbpath}")
         except Exception as e:  # pylint: disable=bare-except
             LOGGER.critical(
                 "Can not open %s. Database may be corrupt: %s", self.dbpath, e
@@ -433,6 +434,7 @@ class Database:
         LOGGER.debug(
             f"Initializing state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}, starttime={starttime}"
         )
+        # TODO: Get current state table and overwrite indexing_complete, filelist_count
         row = State(
             schema_version=schema_version,
             indexing_complete=indexing_complete,
@@ -448,6 +450,8 @@ class Database:
                 LOGGER.debug(
                     f"Found existing state information: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}, starttime={starttime}"
                 )
+                row.indexing_complete = cur.indexing_complete
+                row.filelist_count = cur.filelist_count
                 if cur.schema_version != schema_version:
                     LOGGER.error(
                         f"Attempting to use a cache from an old version of this tool. This will probably fail!"
@@ -474,6 +478,7 @@ class Database:
                 return 0
 
     def get_state(self):
+        #TODO: Might have to make sure we return default State object here if no rows found
         cur = None
         with Session(bind=self.engine) as s:
             cur = s.execute(
@@ -490,18 +495,19 @@ class Database:
     def update_state(
         self, schema_version=SCHEMA_VERSION, indexing_complete=False, filelist_count=0
     ):
-        LOGGER.debug(
-            f"Updating state table schema_version={schema_version}, indexing_complete={indexing_complete}, filelist_count={filelist_count}"
-        )
         with Session(bind=self.engine) as s:
             try:
                 cur = s.execute(
                     select(State).select_from(State).order_by(State.id.desc()).limit(1)
                 ).fetchall()[0][0]
+                LOGGER.debug(f"During update of state, found current state: schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}")
                 if indexing_complete:
                     cur.indexing_complete = indexing_complete
                 if filelist_count > 0:
                     cur.filelist_count = filelist_count
+                LOGGER.debug(
+                    f"Updating state table schema_version={cur.schema_version}, indexing_complete={cur.indexing_complete}, filelist_count={cur.filelist_count}"
+                )
                 s.execute(
                     update(State)
                     .where(State.id == cur.id)
@@ -1706,7 +1712,8 @@ class MigrateJob:
                 output()
                 time.sleep(interval)
 
-        if not DATABASE.get_state().indexing_complete:
+        tmp = DATABASE.get_state()
+        if not DATABASE.get_state().indexing_complete and "XFER_SKIP_INDEXING" not in os.environ:
             start = int(time.time())
             cur = start
 
