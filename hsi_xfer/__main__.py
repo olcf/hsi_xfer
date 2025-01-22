@@ -1027,6 +1027,12 @@ class MigrateJob:
         self.dry_run = args.dry_run
         self.verbose = args.verbose
         self.filelists_path = CACHE.get_unpacked_filelist_root_path()
+        self.fast_filelist_build = args.fast_filelist_build
+        self.skip_filelist_build = args.skip_filelist_build
+        LOGGER.info("--fast-filelist-build has been set. Please keep an eye on resource usage and tune threads accordingly")
+        if self.skip_filelist_build and not args.dry_run:
+            LOGGER.error("--skip-filelist-build must be used with --dry-run. Ignoring...")
+            self.skip_flielist_build = False
 
         self.disable_checksums = args.disable_checksums
         self.preserve_timestamps = args.preserve_timestamps
@@ -1445,40 +1451,41 @@ class MigrateJob:
 
         threads = []
         numfilelists = math.ceil(DATABASE.gettotalnumberofvvs()[0] / self.vvs_per_job)
-       # flists = self.generateFileList()
-       # for vvnum in range(0, numfilelists):
-       #     # Generate the next file list and list of files
-       #     infilename, files = next(flists)
-        for infilename, files in self.generateFileList():
-            # If active threads is < the number of parallel executions allowed, create a new thread
-            if len(threads) < self.parallel_migration_count:
-                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
-                thread = threading.Thread(
-                    target=self.doFilelistMigration, args=(infilename, files)
-                )
-                thread.start()
-                threads.append(thread)
-            else:
-                # If we're out of free threads, poll the threads every second to see if any have died
-                while len(threads) >= self.parallel_migration_count:
-                    time.sleep(1)
-                    threads = [t for t in threads if t.is_alive()]
+        if self.skip_filelist_build:
+       #     flists = self.generateFileList()
+       #     for vvnum in range(0, numfilelists):
+       #         # Generate the next file list and list of files
+       #         infilename, files = next(flists)
+            for infilename, files in self.generateFileList():
+                # If active threads is < the number of parallel executions allowed, create a new thread
+                if len(threads) < self.parallel_migration_count:
+                    LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                    thread = threading.Thread(
+                        target=self.doFilelistMigration, args=(infilename, files)
+                    )
+                    thread.start()
+                    threads.append(thread)
+                else:
+                    # If we're out of free threads, poll the threads every second to see if any have died
+                    while len(threads) >= self.parallel_migration_count:
+                        time.sleep(1)
+                        threads = [t for t in threads if t.is_alive()]
 
-                if len(threads) >= self.parallel_migration_count:
-                    LOGGER.error("Undefined behavior: too many threads")
-                    cleanup_and_die(100)
+                    if len(threads) >= self.parallel_migration_count:
+                        LOGGER.error("Undefined behavior: too many threads")
+                        cleanup_and_die(100)
 
-                # Once theres space, add a new thread and continue
-                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
-                thread = threading.Thread(
-                    target=self.doFilelistMigration, args=(infilename, files)
-                )
-                thread.start()
-                threads.append(thread)
+                    # Once theres space, add a new thread and continue
+                    LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                    thread = threading.Thread(
+                        target=self.doFilelistMigration, args=(infilename, files)
+                    )
+                    thread.start()
+                    threads.append(thread)
 
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
 
         endtime = int(time.time())
         self.elapsedTransferTime = (endtime - starttime)
@@ -2086,6 +2093,13 @@ def main():
         help="Sets the interval between status updates during file transfers",
     )
     parser.add_argument(
+        "-S",
+        "--skip-filelist-build",
+        default=False,
+        type=bool,
+        help="When --dry-run is set, skip building of the filelists",
+    )
+    parser.add_argument(
         "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
     )
     parser.add_argument(
@@ -2102,6 +2116,9 @@ def main():
     )
     parser.add_argument(
         "-V", "--vvs-per-job", default=VVS_PER_JOB, help=argparse.SUPPRESS, type=int
+    )
+    parser.add_argument(
+        "-F", "--fast-filelist-build", default=False, help=argparse.SUPPRESS, type=bool
     )
     parser.add_argument(
         "-t",
