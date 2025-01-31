@@ -2457,7 +2457,7 @@ def main():
         "-S",
         "--skip-filelist-build",
         default=False,
-        type=bool,
+        action="store_true",
         help="When --dry-run is set, skip building of the filelists",
     )
     parser.add_argument(
