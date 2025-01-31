@@ -1049,7 +1049,6 @@ class ListMigrateJob:
                 if line[0] == '/':
                     #assume its a path
                     destpath = line.split(' : ')[0]
-                    LOGGER.debug(f"Adding path to basedir creation set {os.path.dirname(destpath)}")
                     basedirs.add(os.path.dirname(destpath))
 
             LOGGER.info(f"Creating destination directory tree (number of directories = {len(basedirs)})")
