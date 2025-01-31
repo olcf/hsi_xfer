@@ -3,6 +3,7 @@
 # pylint: disable=R,C
 
 import argparse
+import glob
 import math
 import fcntl
 import getpass
@@ -1019,6 +1020,189 @@ class Database:
             )
             LOGGER.debug(f"{e}")
             cleanup_and_die(117)
+
+class ListMigrateJob:
+    def __init__(self, args):
+        self.list_path = args.list_input_override
+        self.move_filelists = args.move_filelists
+        self.preserve_timestamps = args.preserve_timestamps
+        self.transfer_threads = args.parallel_migration_count
+        self.vvs_per_job = args.vvs_per_job
+        self.update_interval = args.update_interval
+        self.addl_flags = args.additional_hsi_flags
+        self.overwrite = args.overwrite_existing
+        self.disable_ta = args.disable_ta
+        self.verbose = args.verbose
+        self.hsi = "/sw/sources/hpss/bin/hsi"
+        self.filesCompleted = 0
+        self.listsTotal = 0
+        self.listsCompleted = 0
+        self.source = args.source
+        self.destination = args.destination
+        self.numfilelists = 0
+
+    def CreateDestTree(self, filelist):
+        LOGGER.info(f"Scanning filelist {filelist} for paths")
+        with open(filelist, 'r', encoding='utf8') as f:
+            basedirs = set()
+            for line in f:
+                if line[0] == '/':
+                    #assume its a path
+                    destpath = line.split(' : ')[0]
+                    LOGGER.debug(f"Adding path to basedir creation set {os.path.dirname(destpath)}")
+                    basedirs.add(os.path.dirname(destpath))
+
+            LOGGER.info(f"Creating destination directory tree (number of directories = {len(basedirs)})")
+            for d in basedirs:
+                d = d.replace('\\', '')
+                os.makedirs(d, exist_ok=True)
+
+    # Does a single hsi migration
+    def doFilelistMigration(self, infilename, filelist_num) -> int:
+        if os.path.exists(infilename):
+            # This is our HSI job
+            migration_job = HSIJob(
+                self.hsi,
+                self.addl_flags,
+                True,
+                self.verbose,
+                "in {}".format(infilename),
+            )
+            LOGGER.info(f"Starting filelist number {filelist_num}: {infilename}")
+            elapsedtime = 0
+            encountered_error = False
+            # Run the job!
+            # Scan through the output looking for errors and md5 sums. Populate the db accordingly
+            last_notif_time = int(time.time())
+            last_notif_idx = 0
+            for chunk in migration_job.run(continueOnFailure=True):
+                for line in chunk:
+                    # Log output to syslog every 10% of total or if its the first iteration
+                    matches = re.match(
+                        r"get\s\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'\s:\s'([^']+/(?:[^/]+/)*[^']+[^/]*)'(?:\s+\([^)]+\))?",
+                        line,
+                    )
+                    if matches:
+                        srcpath = matches.group(2)
+                        self.filesCompleted += 1
+
+                    if "get: Error" in line:
+                        encountered_error = True
+                        LOGGER.error(
+                            "File %s failed to transfer from HPSS",
+                            line.split(" ")[-1],
+                        )
+            # Log the last notifications
+            LOGGER.info(
+                "%s file transfers have been attempted",
+                self.filesCompleted,
+                extra={"block": "syslog"},
+            )
+            payload = {
+                "filescompleted": self.filesCompleted,
+            }
+            self.listsCompleted += 1
+            LOGGER.info(f"Completed file lists {self.listsCompleted} / {self.listsTotal}")
+            LOGGER.info(json.dumps(payload), extra={"block": "cli"})
+            # Reset our files done/completed counter
+            #if self.move_filelists:
+            if not encountered_error:
+                LOGGER.debug(f"Moving filelist to done state: {infilename} -> {infilename}.done")
+                shutil.move(infilename, f"{infilename}.done")
+            else:
+                LOGGER.debug(f"Moving filelist to error state: {infilename} -> {infilename}.error")
+                shutil.move(infilename, f"{infilename}.error")
+        else:
+            LOGGER.debug(
+                "Skipping file list due to invalid path: %s",
+                infilename
+            )
+        return 0
+
+        _stoptimer = False
+
+    def _outputstatus(self):
+        LOGGER.info(
+            "%s file transfers have been attempted and %s/%s file lists have been completed",
+            self.filesCompleted,
+            self.listsCompleted,
+            self.listsTotal,
+            extra={"block": "syslog"},
+        )
+
+    # HPSS/HSI is configured such that we can't rely on HSI to parallelize anything here
+    def Migrate(self) -> int:
+        _stoptimer = False
+
+        def _startoutputtimer(interval, output):
+            while _stoptimer is False:
+                output()
+                time.sleep(interval)
+
+        starttime = int(time.time())
+
+        lists = glob.glob(os.path.join(self.list_path, "*.list"))
+        self.numfilelists = len(lists)
+        self.listsTotal = self.numfilelists
+
+        LOGGER.info(
+            "Launching a sorted batch migration of %d file lists from %s to %s",
+            len(lists),
+            self.source,
+            self.destination,
+        )
+
+        # This will output a status message every self.update_interval seconds (--update-interval)
+        outputer = threading.Thread(
+            target=_startoutputtimer, args=(self.update_interval, self._outputstatus)
+        )
+        outputer.daemon = True
+        outputer.start()
+
+        threads = []
+        numfilelists = self.numfilelists
+        filelistnum = 0
+
+        for infilename in lists:
+            self.CreateDestTree(infilename)
+            filelistnum += 1
+
+            # If active threads is < the number of parallel executions allowed, create a new thread
+            if len(threads) < self.transfer_threads:
+                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                thread = threading.Thread(
+                    target=self.doFilelistMigration, args=(infilename, filelistnum)
+                )
+                thread.start()
+                threads.append(thread)
+            else:
+                # If we're out of free threads, poll the threads every second to see if any have died
+                while len(threads) >= self.transfer_threads:
+                    time.sleep(1)
+                    threads = [t for t in threads if t.is_alive()]
+
+                if len(threads) >= self.transfer_threads:
+                    LOGGER.error("Undefined behavior: too many threads")
+                    cleanup_and_die(100)
+
+                # Once theres space, add a new thread and continue
+                LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
+                thread = threading.Thread(
+                    target=self.doFilelistMigration, args=(infilename, filelistnum)
+                )
+                thread.start()
+                threads.append(thread)
+            liststart = time.time()
+
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+
+        endtime = int(time.time())
+        self.elapsedTransferTime = (endtime - starttime)
+        _stoptimer = True
+
+        return 0
 
 
 # Object to manage the HSIJobs required for migration of files in the DB
@@ -2298,6 +2482,12 @@ def main():
         "-F", "--fast-filelist-build", default=False, help=argparse.SUPPRESS, action="store_true"
     )
     parser.add_argument(
+        "-L", "--list-input-override", default=None, help=argparse.SUPPRESS, type=str
+    )
+    parser.add_argument(
+        "-m", "--move-filelists", default=False, help=argparse.SUPPRESS, action="store_true"
+    )
+    parser.add_argument(
         "-t",
         "--parallel-migration-count",
         default=MIGRATION_THREADS,
@@ -2348,17 +2538,6 @@ def main():
         cleanup_db = False
         cleanup_filelists = False
 
-    LOGGER.debug(
-        f"Creating cache: preserved_files_path={args.preserved_files_path} cleanup_filelists={cleanup_filelists} cleanup_db={cleanup_db} existing_path={args.cache_path} debug={args.debug}"
-    )
-    CACHE = Cache(
-        args.verbose,
-        args.preserved_files_path,
-        cleanup_filelists=cleanup_filelists,
-        cleanup_db=cleanup_db,
-        existing_path=args.cache_path,
-        debug=args.debug,
-    )
 
     global DB_TX_SIZE
     DB_TX_SIZE = args.db_tx_size
@@ -2366,73 +2545,95 @@ def main():
     global PROFILER
     PROFILER = Profiler(args.trace)
 
-    LOGGER.info(
-        "Starting sorted batch transfer from HPSS (%s) to destination (%s)",
-        args.source,
-        args.destination,
-    )
-    # Create our migration job
-    job = MigrateJob(args)
+    if args.list_input_override is not None:
+        LOGGER.info(f"Overriding caching mechanism and using pregenerated lists found at {args.list_input_override}")
+        LOGGER.error(f"This will override checksumming, --dry-run, --cache-path, and any other flags!")
+        job = ListMigrateJob(args)
+        job.Migrate()
+        PROFILER.print_report()
+        LOCKFILE.cleanup()
+        LOGGER.debug("Finished all cleanups", extra={"block": "syslog"})
+        return 0
+    else:
+        LOGGER.debug(
+            f"Creating cache: preserved_files_path={args.preserved_files_path} cleanup_filelists={cleanup_filelists} cleanup_db={cleanup_db} existing_path={args.cache_path} debug={args.debug}"
+        )
+        CACHE = Cache(
+            args.verbose,
+            args.preserved_files_path,
+            cleanup_filelists=cleanup_filelists,
+            cleanup_db=cleanup_db,
+            existing_path=args.cache_path,
+            debug=args.debug,
+        )
 
-    if args.cache_path is not None:
-        LOGGER.info("Resuming interrupted transfer.")
+        LOGGER.info(
+            "Starting sorted batch transfer from HPSS (%s) to destination (%s)",
+            args.source,
+            args.destination,
+        )
+        # Create our migration job
+        job = MigrateJob(args)
 
-    # Populate the db with HPSS data
-    LOGGER.info("Indexing candidate files for transfer from HPSS...")
-    job.getSrcFiles()
+        if args.cache_path is not None:
+            LOGGER.info("Resuming interrupted transfer.")
 
-    # Check for files that exist in the destination
-    LOGGER.info("Checking for existing files...")
-    job.checkForExisting()
+        # Populate the db with HPSS data
+        LOGGER.info("Indexing candidate files for transfer from HPSS...")
+        job.getSrcFiles()
 
-    # Create the destination directory structure
-    if not args.dry_run:
-        LOGGER.info("Creating destination directory structure")
-        job.createDestTree()
+        # Check for files that exist in the destination
+        LOGGER.info("Checking for existing files...")
+        job.checkForExisting()
 
-    job.startMigrate()
+        # Create the destination directory structure
+        if not args.dry_run:
+            LOGGER.info("Creating destination directory structure")
+            job.createDestTree()
 
-    # Start checksumming destination files
-    # We will need the destchecksumthread to poll the filesystem and DB to detect when files are done transferring
-    report = {}
-    global DYING
-    if not args.dry_run and not args.disable_checksums:
-        job.startDestChecksumming()
-        # Generate our report
-        report = job.checksumMismatchReport()
+        job.startMigrate()
 
-    # generate report
-    finalreport = job.genReport(report)
+        # Start checksumming destination files
+        # We will need the destchecksumthread to poll the filesystem and DB to detect when files are done transferring
+        report = {}
+        global DYING
+        if not args.dry_run and not args.disable_checksums:
+            job.startDestChecksumming()
+            # Generate our report
+            report = job.checksumMismatchReport()
 
-    LOGGER.info("Generating transfer report...")
-    LOGGER.debug(json.dumps(finalreport, indent=2))
+        # generate report
+        finalreport = job.genReport(report)
 
-    # Write the report to a file
-    reportfilename = "hsi_xfer_report_{}.json".format(int(time.time()))
-    reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
-    with open(reportfilename, "w", encoding="UTF-8") as f:
-        json.dump(finalreport, f, indent=2)
-    LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
-    if not args.dry_run:
-        LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
+        LOGGER.info("Generating transfer report...")
+        LOGGER.debug(json.dumps(finalreport, indent=2))
 
-        syslogpayload = {
-            "total_size_in_bytes": finalreport["total_size_in_bytes"],
-            "elapsed_time": finalreport["elapsed_time"],
-            "num_successful_files": len(finalreport["successful_transfers"]),
-            "num_failed_files": len(finalreport["failed_transfers"]),
-            "num_files_failed_to_checksum": len(finalreport["failed_to_checksum"]),
-            "num_files_skipped": len(finalreport["existing_files_skipped"]),
-        }
+        # Write the report to a file
+        reportfilename = "hsi_xfer_report_{}.json".format(int(time.time()))
+        reportfilename = os.path.join(CACHE.get_unpacked_report_dir(), reportfilename)
+        with open(reportfilename, "w", encoding="UTF-8") as f:
+            json.dump(finalreport, f, indent=2)
+        LOGGER.info("Transfer complete. Report has been written to %s", reportfilename)
+        if not args.dry_run:
+            LOGGER.info(f"Average transfer speed: {finalreport['average_speed']} MB/s")
 
-        LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={"block": "cli"})
+            syslogpayload = {
+                "total_size_in_bytes": finalreport["total_size_in_bytes"],
+                "elapsed_time": finalreport["elapsed_time"],
+                "num_successful_files": len(finalreport["successful_transfers"]),
+                "num_failed_files": len(finalreport["failed_transfers"]),
+                "num_files_failed_to_checksum": len(finalreport["failed_to_checksum"]),
+                "num_files_skipped": len(finalreport["existing_files_skipped"]),
+            }
 
-    PROFILER.print_report()
-    DATABASE.cleanup()
-    CACHE.cleanup()
-    LOCKFILE.cleanup()
-    LOGGER.debug("Finished all cleanups", extra={"block": "syslog"})
-    return 0
+            LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={"block": "cli"})
+
+        PROFILER.print_report()
+        DATABASE.cleanup()
+        CACHE.cleanup()
+        LOCKFILE.cleanup()
+        LOGGER.debug("Finished all cleanups", extra={"block": "syslog"})
+        return 0
 
 
 def __handle_sigs(signum, frame):
