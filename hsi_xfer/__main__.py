@@ -1029,7 +1029,8 @@ class MigrateJob:
         self.filelists_path = CACHE.get_unpacked_filelist_root_path()
         self.fast_filelist_build = args.fast_filelist_build
         self.skip_filelist_build = args.skip_filelist_build
-        LOGGER.info("--fast-filelist-build has been set. Please keep an eye on resource usage and tune threads accordingly")
+        if self.fast_filelist_build:
+            LOGGER.info("--fast-filelist-build has been set. Please keep an eye on resource usage and tune threads accordingly")
         if self.skip_filelist_build and not args.dry_run:
             LOGGER.error("--skip-filelist-build must be used with --dry-run. Ignoring...")
             self.skip_flielist_build = False
@@ -1077,7 +1078,9 @@ class MigrateJob:
     # Check the destination filesystem for files that match names at the predicted destination directory
     def checkForExisting(self):
         if not self.overwrite:
+            LOGGER.debug("DB Query start: dumpfiles")
             files = DATABASE.dumpfiles()
+            LOGGER.debug(f"Got {len(files)} from DB during checkForExisting")
 
             for file in files:
                 destpath = file[0].dest
@@ -1175,6 +1178,165 @@ class MigrateJob:
     # - Populate the db with the resulting information
     # - Profit
 
+    def fastGenerateFileList(self) -> (str, list):
+        # Get chunked list of vvs
+        allvvs = DATABASE.getvvswithnoncompletefiles()
+
+        vvs = list(self.chunk(allvvs, int(self.vvs_per_job)))
+
+        LOGGER.info(
+            f"Will generate {math.ceil(len(vvs)/self.parallel_migration_count)} file lists",
+            extra={"block": "cli"},
+        )
+
+        # Get list of exisitng files from the db
+        self.existingFiles = DATABASE.getexistingfiles()
+
+        if self.overwrite:
+            self.existingFiles = []
+
+        if len(self.existingFiles) > 0:
+            LOGGER.debug("Found existing files:")
+            # Format existingFiles so it looks better
+            existing = []
+            for f in self.existingFiles:
+                existing.append({"source": f[0], "destination": f[1]})
+            LOGGER.debug(json.dumps(existing, indent=2))
+
+        LOGGER.info("Creating file lists from indexed HPSS data...")
+
+        # Set some variables for status output (esp if not using the progress bar)
+        filelistnum = 0
+        self.filesCompleted += len(self.existingFiles)
+        LOGGER.info(
+            f"Will transfer {self.filesTotal} files from HPSS", extra={"block": "cli"}
+        )
+
+        # If we don't set --additional-hsi-flags, assume we're using keytabs for auth. If so, then we can use the progress bar
+        # Otherwise, the progress bar will overwrite the PASSCODE: prompt so it'll just appear to 'hang' for users
+
+        # Launch an HSI job for each chunk of vvs (generally 1 vv/chunk but see below)
+        DATABASE.update_state(filelist_count=len(vvs))
+
+        for vvlist in vvs:
+            files = []
+            allfilesinlist = []
+            filelistnum += 1
+            infilename = os.path.join(
+                self.filelists_path, f"hsi_xfer.{filelistnum}.list"
+            )
+            # Check if infile exists and the tmp files don't. If tmp files exist, we can assume that it died while writing the temp files. If it does, then a cache was probably passed in
+            if os.path.exists(infilename):
+                # Generate our list of files from the db. Probably faster to read the infile, but this is easier
+                for chunk in DATABASE.getfilesbyvvlist(vvlist):
+                    allfilesinlist.extend(
+                        [f for f in chunk if f not in self.existingFiles]
+                    )
+
+                if len(allfilesinlist) > 0:
+                    LOGGER.info(
+                        f"Found existing filelist {infilename}, attempting to use as-is"
+                    )
+                    yield infilename, allfilesinlist
+                    continue
+                else:
+                    LOGGER.info(
+                        f"Found exisiting filelist {infilename}, but it is unusable. Regenerating..."
+                    )
+                    files = []
+                    allfilesinlist = []
+                    try:
+                        os.remove(infilename)
+                    except OSError as e:
+                        if e.errno != errno.ENOENT:
+                            LOGGER.error(
+                                f"Could not remove existing file list {infilename}. Please try again without --cache-path"
+                            )
+                            cleanup_and_die(201)
+                        else:
+                            pass
+
+            # Open infilename and hashlist
+            # Write chunks from db straight to hashlist 
+            # run hashlist
+            # write the hashcreate file
+            # write chunks directly to infilename if not exists
+            #with open(tmpgetfilename, "a", encoding="UTF-8") as getfile, open(
+            #    tmphashfilename, "a", encoding="UTF-8"
+            #) as hashfile:
+
+            with open(infilename, "a", encoding="UTF-8") as infile:
+                getcmd = (
+                    f"get {'-P' if self.preserve_timestamps else ''} -T on << EOF\n"
+                )
+                if self.disable_ta:
+                    getcmd = f"get {'-P' if self.preserve_timestamps else ''} -T off << EOF\n"
+
+                # hashcreate can not use the TA, so we force -T off
+                # TODO: write separate hash file and append?
+                #hashcreatecmd = "hashcreate -T off << EOF\n"
+                #infile.write(getcmd)
+
+                #if not self.disable_checksums:
+                #    infile.write(hashcreatecmd)
+
+            hashcreate_list = []
+            for chunk in DATABASE.getfilesbyvvlist(vvlist):
+                get_list = []
+                files = chunk
+                if not self.overwrite:
+                    files = [f for f in files if f not in self.existingFiles]
+
+                allfilesinlist.extend(files)
+
+                if len(files) > 0:
+                    LOGGER.debug(
+                        "Writing list of %s files to master file list...",
+                        len(chunk),
+                    )
+
+                    # Do a hashlist to get files that have hashes already
+                    # runHashList() will write the infile for that command
+                    if not self.disable_checksums:
+                        hashlistout = self.runHashList(files, filelistnum)
+                        # if file has hash; save to db
+                        self.writeExistingHashes(hashlistout)
+                        # to_hash gets written to the infile; add a hashcreate for all files that don't have hashes already
+                        to_hash = [f for f in files if f[0] not in hashlistout]
+                        if len(to_hash) > 0:
+                            hashcreate_list.append(
+                                "\n".join(
+                                    ["{}".format(sanitize(f[0])) for f in to_hash]
+                                )
+                            )
+
+                    get_list = "\n".join(
+                            [
+                                "{} : {}".format(sanitize(f[1]), sanitize(f[0]))
+                                for f in files
+                            ]
+                        )
+                    if len(get_list) > 0:
+                        with open(infilename, "a", encoding="utf-8") as infile:
+                            # TODO: doesn't need to be a list anymore just a string
+                            infile.write(get_list)
+
+            with open(infilename, "a", encoding="UTF-8") as infile:
+                # hashcreate can not use the TA, so we force -T off
+                infile.write("\nEOF\n")
+                hashcreatecmd = "hashcreate -T off << EOF\n"
+                infile.write(getcmd)
+
+                if not self.disable_checksums:
+                    infile.write(hashcreatecmd)
+                    for file in hashcreate_list:
+                        infile.write(file)
+                    infile.write("\nEOF")
+
+
+            if len(allfilesinlist) > 0:
+                yield (infilename, allfilesinlist)
+
     def generateFileList(self) -> (str, list):
         # Get chunked list of vvs
         allvvs = DATABASE.getvvswithnoncompletefiles()
@@ -1236,6 +1398,7 @@ class MigrateJob:
             ):
                 # Generate our list of files from the db. Probably faster to read the infile, but this is easier
                 for chunk in DATABASE.getfilesbyvvlist(vvlist):
+                    LOGGER.debug(f"Got chunk from db of size {len(chunk)}")
                     allfilesinlist.extend(
                         [f for f in chunk if f not in self.existingFiles]
                     )
@@ -1451,12 +1614,20 @@ class MigrateJob:
 
         threads = []
         numfilelists = math.ceil(DATABASE.gettotalnumberofvvs()[0] / self.vvs_per_job)
-        if self.skip_filelist_build:
+        if not self.skip_filelist_build:
        #     flists = self.generateFileList()
        #     for vvnum in range(0, numfilelists):
        #         # Generate the next file list and list of files
        #         infilename, files = next(flists)
-            for infilename, files in self.generateFileList():
+            liststart = time.time()
+            listgenerator = self.generateFileList
+            # TODO: This is turned off right now!
+            #if self.fast_filelist_build:
+            #    listgenerator = self.fastGenerateFileList
+            for infilename, files in listgenerator():
+            #for infilename, files in self.generateFileList():
+                listend = time.time()
+                LOGGER.debug(f"Generated filelist in {listend - liststart}s")
                 # If active threads is < the number of parallel executions allowed, create a new thread
                 if len(threads) < self.parallel_migration_count:
                     LOGGER.debug(f"Launching new thread. Active threads: {len(threads)}")
@@ -1482,6 +1653,7 @@ class MigrateJob:
                     )
                     thread.start()
                     threads.append(thread)
+                liststart = time.time()
 
             # Wait for all threads to complete
             for thread in threads:
@@ -1750,9 +1922,14 @@ class MigrateJob:
                     objtype = s[0]
                     # If this is a file entry, save it with the VV, and infer the directory
                     if "FILE" in objtype:
-                        file, size, vv = s[1], s[2], s[5]
-                        files.append((file, vv, size))
-                        dirs.add(os.path.dirname(file))
+                        try:
+                            file, size, vv = s[1], s[2], s[5]
+                            files.append((file, vv, size))
+                            dirs.add(os.path.dirname(file))
+                        except IndexError:
+                            LOGGER.error(f"s = {s}")
+                            cleanup_and_die(456)
+
                         self.indexedFilesComplete += 1
                         self.indexedDirsComplete = len(dirs)
                 LOGGER.debug(f"Chunk processing took {int(time.time())-pstart}s")
@@ -2118,7 +2295,7 @@ def main():
         "-V", "--vvs-per-job", default=VVS_PER_JOB, help=argparse.SUPPRESS, type=int
     )
     parser.add_argument(
-        "-F", "--fast-filelist-build", default=False, help=argparse.SUPPRESS, type=bool
+        "-F", "--fast-filelist-build", default=False, help=argparse.SUPPRESS, action="store_true"
     )
     parser.add_argument(
         "-t",
