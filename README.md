@@ -7,7 +7,7 @@ This tool (`hsi_xfer`) was developed to provide a smooth and user-friendly exper
 * Checkpointing to allow interrupted transfers to continue roughly where they left off
 * HSI threads are launched in parallel to allow concurrent transfer of file lists
 * JSON formatted reporting of file transfers
-* Caching of large lists of files to prevent reindexing upon reinvokation of the tool
+* Caching of large lists of files to prevent reindexing upon reinvoking the tool
 
 ## How it works:
 
