@@ -2460,37 +2460,37 @@ def main():
         help="When --dry-run is set, skip building of the filelists",
     )
     parser.add_argument(
-        "--checksum-threads", help=argparse.SUPPRESS, default=4, type=int
+        "--checksum-threads", help="Number of threads to use for destination checksumming", default=4, type=int
     )
     parser.add_argument(
-        "--debug", default=False, help=argparse.SUPPRESS, action="store_true"
+        "--debug", default=False, help="Enable debug output", action="store_true"
     )
     parser.add_argument(
-        "-T", "--disable-ta", default=False, help=argparse.SUPPRESS, action="store_true"
+        "-T", "--disable-ta", default=False, help="Disables the HPSS transfer agent", action="store_true"
     )
     parser.add_argument(
-        "-s", "--db-tx-size", help=argparse.SUPPRESS, default=9000, type=int
+        "-s", "--db-tx-size", help="Sets the maximum number of rows for any individual database transaction", default=9000, type=int
     )
     parser.add_argument(
-        "-r", "--trace", default=False, help=argparse.SUPPRESS, action="store_true"
+        "-r", "--trace", default=False, help="Enable trace output", action="store_true"
     )
     parser.add_argument(
-        "-V", "--vvs-per-job", default=VVS_PER_JOB, help=argparse.SUPPRESS, type=int
+        "-V", "--vvs-per-job", default=VVS_PER_JOB, help="Sets the number of HPSS VVs that each HSI thread processes at any one time", type=int
     )
     parser.add_argument(
         "-F", "--fast-filelist-build", default=False, help=argparse.SUPPRESS, action="store_true"
     )
     parser.add_argument(
-        "-L", "--list-input-override", default=None, help=argparse.SUPPRESS, type=str
+            "-L", "--list-input-override", default=None, help="Processes an exisitng directory of HSI in-files. NOTE: This disables all caching, checksumming, and checkpointing features!", type=str
     )
     parser.add_argument(
-        "-m", "--move-filelists", default=False, help=argparse.SUPPRESS, action="store_true"
+        "-m", "--move-filelists", default=False, help="When -L is used, this flag is used to determine whether to move processed in-file lists to either *.error or *.done", action="store_true"
     )
     parser.add_argument(
         "-t",
         "--parallel-migration-count",
         default=MIGRATION_THREADS,
-        help=argparse.SUPPRESS,
+        help="Sets the number of parallel HSI threads in the pool to dispatch filelists to",
         type=int,
     )
     parser.add_argument(
@@ -2505,28 +2505,6 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose, args.enable_log_timestamps)
-
-    # if args.parallel_migration_count != 1 or args.debug or args.disable_ta or args.db_tx_size != 9000 or args.trace or args.checksum_threads != 4:
-    if (
-        args.debug
-        or args.disable_ta
-        or args.db_tx_size != 9000
-        or args.trace
-        or args.checksum_threads != 4
-        or args.parallel_migration_count != VVS_PER_JOB
-    ):
-        LOGGER.error("Hidden flag usage detected", extra={"block": "cli"})
-        LOGGER.error(
-            f"Flag: --parallel-migration-count={args.parallel_migration_count}",
-            extra={"block": "cli"},
-        )
-        LOGGER.error(
-            f"Flag: --checksum-threads={args.checksum_threads}", extra={"block": "cli"}
-        )
-        LOGGER.error(f"Flag: --debug={args.debug}", extra={"block": "cli"})
-        LOGGER.error(f"Flag: --disable-ta={args.disable_ta}", extra={"block": "cli"})
-        LOGGER.error(f"Flag: --db-tx-size={args.db_tx_size}", extra={"block": "cli"})
-        LOGGER.error(f"Flag: --trace={args.trace}", extra={"block": "cli"})
 
     global CACHE
     cleanup_db = True
