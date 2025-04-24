@@ -1,5 +1,51 @@
 # hsi_xfer
 
+## Overview:
+This tool (`hsi_xfer`) was developed to provide a smooth and user-friendly experience to users for moving bulk data out of our aging HPSS system. Without having a Globus endpoint available for use, the only tool available to users was the generic `hsi` tool, which does not provide the same level of experience, or feature parity with Globus. `hsi_xfer` attempts to bridge this gap by providing the following additional features:
+
+* Checksumming of files after transfer to ensure data integrity at the destination
+* Checkpointing to allow interrupted transfers to continue roughly where they left off
+* HSI threads are launched in parallel to allow concurrent transfer of file lists
+* JSON formatted reporting of file transfers
+* Caching of large lists of files to prevent reindexing upon reinvokation of the tool
+
+## How it works:
+
+* A user provides a source path on HPSS, and a destination path elsewhere
+* `hsi_xfer` will recursively index every file underneath the `source` path and cache this list.
+    * This part is skipped if the user provides a path to an existing cache file from a previous run, if the previous run completed checksumming
+* The list of indexed files are broken up into multiple file lists to be retrieved in parallel. The tool, by default, will put all files that exist on a single HPSS VV in the same file list. This helps to prevent damage to the tape, as well as optimizes the retrieval time for all these files by minimizing seeks and tape library thrashing
+    * If a file exists (both file name and size match on the destination and HPSS), or the file is already marked as "successfully transferred" in the cache, the file will be skipped, saving time and bandwith
+* A thread pool of `hsi` processes is created, and the file lists are passed into the pool for concurrent checksumming and transfer.
+    * If a checksum for a file does not exist in HPSS, one is created at this time.
+    * The checksum is retreived and saved into the cache
+    * The file is then transferred to the destination.
+    * As `hsi` processes complete, new threads are spawned and provided with the next VV's file list
+* Once the transfer is complete, another thread pool is spawned to do concurrent checksumming on the destination filesystem. This checksum is also saved in the cache.
+* Finally, `hsi_xfer` will compare the HPSS checksum with the destination checksum and generate a JSON formatted report that is output in a file in the user's current working directory. If the file was successfully transferred, but checksums did not match, the file is marked as a "failed transfer" in the report
+
+
+## Prerequisites:
+
+* `hsi`
+* python 3.12
+* conda
+
+## To build:
+
+To build a copy of the python environment, run the following:
+```
+$ ./build.sh /path_to_dev_env
+```
+
+## To run:
+
+To run the script, simply call the `hsi_xfer` tool:
+```
+$ /path/to/conda/env/bin/hsi_xfer/hsi_xfer
+```
+
+## Usage:
 ```
 usage: hsi_xfer [-h] [-D] [-C CACHE_PATH] [-l] [-P] [-p] [-c] [-a ADDITIONAL_HSI_FLAGS] [-e] [-f PRESERVED_FILES_PATH] [-E] [-i UPDATE_INTERVAL] [-S] [--checksum-threads CHECKSUM_THREADS] [--debug] [-T] [-s DB_TX_SIZE] [-r] [-V VVS_PER_JOB] [-L LIST_INPUT_OVERRIDE] [-m]
                 [-t PARALLEL_MIGRATION_COUNT] [-v]
@@ -51,14 +97,4 @@ options:
                         Sets the number of parallel HSI threads in the pool to dispatch filelists to
   -v, --verbose         Output additional information about the transfer
 
-```
-Motivation:
-
-Overview:
-
-To build:
-```
-```
-To run:
-```
 ```
