@@ -1033,7 +1033,7 @@ class ListMigrateJob:
         self.overwrite = args.overwrite_existing
         self.disable_ta = args.disable_ta
         self.verbose = args.verbose
-        self.hsi = "/sw/sources/hpss/bin/hsi"
+        self.hsi = args.hsi_path
         self.filesCompleted = 0
         self.listsTotal = 0
         self.listsCompleted = 0
@@ -1228,7 +1228,7 @@ class MigrateJob:
         self.overwrite = args.overwrite_existing
         self.disable_ta = args.disable_ta
         self.checksum_threads = args.checksum_threads
-        self.hsi = "/sw/sources/hpss/bin/hsi"
+        self.hsi = args.hsi_path
         self.indexedFilesComplete = 0
         self.indexedDirsComplete = 0
         self.elapsedTransferTime = 0
@@ -2376,6 +2376,13 @@ def main():
         help="Top level directory on Kronos to put files. An identical directory structure will be created here as exists in HPSS under `source`",
     )
     parser.add_argument(
+        "-H",
+        "--hsi-path",
+        type=str,
+        default=os.environ.get('HSI_PATH'),
+        help="Generate the file lists but do not actually checksum or transfer files, and output the `hsi` commands that would have been used",
+    )
+    parser.add_argument(
         "-D",
         "--dry-run",
         action="store_true",
@@ -2505,6 +2512,10 @@ def main():
     args = parser.parse_args()
 
     initLogger(args.verbose, args.enable_log_timestamps)
+    if not args.hsi_path:
+        LOGGER.error(f"Could not find hsi executable. Please use either --hsi-path or set $HSI_PATH to the path to the hsi executable");
+        cleanup_and_die(555)
+
 
     global CACHE
     cleanup_db = True
