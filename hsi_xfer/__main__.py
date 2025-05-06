@@ -42,7 +42,6 @@ MIGRATION_THREADS = 2
 FILE_RETRY_LIMIT = 3
 LOGGER = None
 LOCKFILE = None
-PROFILER = None
 DB_TX_SIZE = None  # This gets set by the -s flag; defaults to 9000
 CACHE = None
 DATABASE = None
@@ -2152,7 +2151,6 @@ class MigrateJob:
         else:
             LOGGER.info("Skipping file indexing due to input cache")
         _stoptimer = True
-        PROFILER.snapshot()
 
 
 # Our HSI class. This just wraps subprocess+hsi to make it a little easier to manage
@@ -2260,7 +2258,6 @@ class HSIJob:
             if not continueOnFailure or DYING:
                 cleanup_and_die(120)
 
-        PROFILER.snapshot()
         if len(output) > 0:
             yield output
 
@@ -2331,38 +2328,6 @@ def initLogger(verbose, enable_timestamps):
         LOGGER.debug("Set logger to debug because --verbose")
 
 
-class Profiler:
-    def __init__(self, trace):
-        self.trace = trace
-        if trace:
-            tracemalloc.start(10)
-
-    def snapshot(self):
-        if self.trace:
-            self.snap = tracemalloc.take_snapshot()
-
-    def print_report(self):
-        if self.trace:
-            snap = self.snap
-            idx = 0
-            for stats in snap.statistics("lineno"):
-                print(f"========== SNAPSHOT {idx} =============")
-                print(stats)
-                print(stats.traceback.format())
-                idx += 1
-
-            print("\n=========== USEFUL METHODS ===========")
-            print("\nTraceback Limit : ", tracemalloc.get_traceback_limit(), " Frames")
-
-            print("\nTraced Memory (Current, Peak): ", tracemalloc.get_traced_memory())
-
-            print(
-                "\nMemory Usage by tracemalloc Module : ",
-                tracemalloc.get_tracemalloc_memory(),
-                " bytes",
-            )
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2380,7 +2345,7 @@ def main():
         "--hsi-path",
         type=str,
         default=os.environ.get('HSI_PATH'),
-        help="Generate the file lists but do not actually checksum or transfer files, and output the `hsi` commands that would have been used",
+        help="Path the the HSI executable. This argument can be ignored if $HSI_PATH is set appropriately in your shell",
     )
     parser.add_argument(
         "-D",
@@ -2530,15 +2495,11 @@ def main():
     global DB_TX_SIZE
     DB_TX_SIZE = args.db_tx_size
 
-    global PROFILER
-    PROFILER = Profiler(args.trace)
-
     if args.list_input_override is not None:
         LOGGER.info(f"Overriding caching mechanism and using pregenerated lists found at {args.list_input_override}")
         LOGGER.error(f"This will override checksumming, --dry-run, --cache-path, and any other flags!")
         job = ListMigrateJob(args)
         job.Migrate()
-        PROFILER.print_report()
         LOCKFILE.cleanup()
         LOGGER.debug("Finished all cleanups", extra={"block": "syslog"})
         return 0
@@ -2616,7 +2577,6 @@ def main():
 
             LOGGER.info(f"finalreport={json.dumps(syslogpayload)}", extra={"block": "cli"})
 
-        PROFILER.print_report()
         DATABASE.cleanup()
         CACHE.cleanup()
         LOCKFILE.cleanup()
